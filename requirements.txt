@@ -1,0 +1,24 @@
+# Freebuff Desktop - zależności (Python 3.11+, Windows)
+#
+# Instalacja:
+#   pip install -r requirements.txt
+#
+# Uwaga: adbutils wymaga binarnego `adb` (platform-tools) w PATH.
+
+# GUI
+PyQt6>=6.6
+
+# Globalne przechwytywanie klawiszy (Keymapper - mapowanie klawiszy laptopa)
+pynput>=1.7.6
+
+# Czysto-pythonowy klient ADB (Keymapper via ADB, połączenie ze scrcpy)
+adbutils>=2.6
+
+# Klient scrcpy do podglądu ekranu Androida (stream H.264 przez ADB)
+# Uwaga: pakiet "scrcpy-py" nie istnieje na PyPI; "scrcpy" (0.0.4) wymaga
+# Pythona <3.10, dlatego używamy utrzymywanego "scrcpy-client".
+scrcpy-client>=1.6,<2
+
+# Dekoder wideo (PyAV) i numpy - zależności scrcpy-client do ramek obrazu
+av>=10
+numpy>=1.24
