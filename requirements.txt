@@ -16,9 +16,12 @@ adbutils>=2.6
 
 # Klient scrcpy do podglądu ekranu Androida (stream H.264 przez ADB)
 # Uwaga: pakiet "scrcpy-py" nie istnieje na PyPI; "scrcpy" (0.0.4) wymaga
-# Pythona <3.10, dlatego używamy utrzymywanego "scrcpy-client".
-scrcpy-client>=1.6,<2
+# Pythona <3.10. Używamy utrzymywanego "scrcpy-client"
+# (leng-yue/py-scrcpy-client) z PyPI. Wersja 0.4.7 wymaga adbutils>=2,<3,
+# av>=12,<13 i numpy>=2,<3 - w pełni zgodna z resztą projektu (bez potrzeby
+# instalowania z git).
+scrcpy-client>=0.4.7,<0.5
 
 # Dekoder wideo (PyAV) i numpy - zależności scrcpy-client do ramek obrazu
-av>=10
-numpy>=1.24
+av>=12
+numpy>=2
