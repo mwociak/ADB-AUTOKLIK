@@ -1,8 +1,8 @@
 """AndroidScreenWidget - podgląd ekranu telefonu na żywo (scrcpy).
 
 Widżet PyQt6 wyświetla strumień wideo z telefonu przez ``scrcpy-client``
-wraz z nakładką zdefiniowanych akcji keymapy (tapy i swipe'y). Kliknięcie
-lewym przyciskiem myszy na obraz telefonu emituje sygnał
+wraz z nakładką zdefiniowanych akcji keymapy (tapy, swipe'y i makra).
+Kliknięcie lewym przyciskiem myszy na obraz telefonu emituje sygnał
 :attr:`point_selected` z rzeczywistymi współrzędnymi ekranu (x_phone,
 y_phone) - z uwzględnieniem skalowania i czarnych pasów (letterboxing).
 
@@ -11,6 +11,8 @@ gest myszą: wciska LPM w punkcie startowym, przeciąga i puszcza w punkcie
 końcowym - widżet emituje wtedy :attr:`swipe_selected` (x1, y1, x2, y2).
 Podczas przeciągania rysowany jest podgląd strzałki; zapisane swipe'y
 rysowane są na nakładce jako strzałki z klawiszem przy punkcie startowym.
+Makra rysowane są jako seria kroków (kółka tapów i strzałki swipe'ów)
+z klawiszem przy pierwszym kroku.
 
 Wymagane zależności: PyQt6, scrcpy-client (z git main -
 ``leng-yue/py-scrcpy-client``), numpy.
@@ -30,7 +32,7 @@ from PyQt6.QtWidgets import QWidget
 # serial - używamy wariantu z serialem (spójnie z ADBController).
 from scrcpy import Client
 
-from config_manager import KeyPoint, SwipePoint
+from config_manager import KeyPoint, MacroPoint, SwipePoint
 
 # Domyślne parametry streamu: pełna rozdzielczość telefonu (max_width=0),
 # ograniczone fps (oszczędność CPU/bandwidth), klatki tylko gdy nowe.
@@ -101,8 +103,8 @@ class AndroidScreenWidget(QWidget):
         self._draw_rect = QRectF()  # prostokąt rysowania (letterbox) w koordynatach widżetu
         self._frame_pending = False
 
-        # Nakładka (akcje keymapy: tapy i swipe'y)
-        self._overlay_points: list[KeyPoint | SwipePoint] = []
+        # Nakładka (akcje keymapy: tapy, swipe'y i makra)
+        self._overlay_points: list[KeyPoint | SwipePoint | MacroPoint] = []
 
         # Gesty myszy: "tap" (klik) lub "swipe" (przeciągnij i puść)
         self._gesture_mode = "tap"
@@ -262,10 +264,13 @@ class AndroidScreenWidget(QWidget):
             )
 
     def _draw_overlay_point(
-        self, painter: QPainter, point: KeyPoint | SwipePoint
+        self, painter: QPainter, point: KeyPoint | SwipePoint | MacroPoint
     ) -> None:
-        """Rysuje akcję keymapy: tap = kółko, swipe = strzałka + kółko startowe."""
+        """Rysuje akcję keymapy: tap = kółko, swipe = strzałka, makro = kroki."""
         if self._phone_size is None:
+            return
+        if isinstance(point, MacroPoint):
+            self._draw_macro_overlay(painter, point)
             return
         if isinstance(point, SwipePoint):
             sx, sy = self._to_widget(point.x1, point.y1)
@@ -279,6 +284,31 @@ class AndroidScreenWidget(QWidget):
             return
         cx, cy = self._to_widget(point.x, point.y)
         self._draw_overlay_circle(painter, cx, cy, point.key)
+
+    def _draw_macro_overlay(self, painter: QPainter, point: MacroPoint) -> None:
+        """Rysuje kroki makra: tapy (kółka), swipe'y (strzałki), klawisz przy pierwszym kroku."""
+        if self._phone_size is None:
+            return
+        first: tuple[float, float] | None = None
+        for action in point.actions:
+            kind = action.get("type")
+            if kind == "tap":
+                x, y = self._to_widget(int(action["x"]), int(action["y"]))
+                if first is None:
+                    first = (x, y)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(24, 140, 255, 90))
+                painter.drawEllipse(QPointF(x, y), 8.0, 8.0)
+            elif kind == "swipe":
+                sx, sy = self._to_widget(int(action["x1"]), int(action["y1"]))
+                ex, ey = self._to_widget(int(action["x2"]), int(action["y2"]))
+                if first is None:
+                    first = (sx, sy)
+                self._draw_overlay_arrow(
+                    painter, (sx, sy), (ex, ey), _SWIPE_ARROW, width=2.5
+                )
+        if first is not None:
+            self._draw_overlay_circle(painter, first[0], first[1], point.key)
 
     def _draw_overlay_circle(self, painter: QPainter, cx: float, cy: float, key: str) -> None:
         """Rysuje półprzezroczyste kółko z literą klawisza w środku."""
@@ -419,8 +449,10 @@ class AndroidScreenWidget(QWidget):
     # Nakładka akcji keymapy
     # ------------------------------------------------------------------
 
-    def set_overlay_points(self, points: list[KeyPoint | SwipePoint]) -> None:
-        """Ustawia akcje keymapy (tapy i swipe'y) do narysowania na ekranie."""
+    def set_overlay_points(
+        self, points: list[KeyPoint | SwipePoint | MacroPoint]
+    ) -> None:
+        """Ustawia akcje keymapy (tapy, swipe'y, makra) do narysowania na ekranie."""
         self._overlay_points = list(points)
         self.update()
 

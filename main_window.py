@@ -2,18 +2,21 @@
 
 Integruje wszystkie warstwy projektu:
 - :class:`AndroidScreenWidget` - podgląd ekranu telefonu (scrcpy) z nakładką,
-- :class:`ADBController` - komunikacja ADB (dotknięcia i swipe'y),
+- :class:`ADBController` - komunikacja ADB (dotknięcia, swipe'y),
 - :class:`ConfigManager` - profile akcji mapowania (keymap.json),
-- :class:`KeymapperEngine` - globalny nasłuch klawiszy (pynput) w osobnym wątku.
+- :class:`KeymapperEngine` - globalny nasłuch klawiszy (pynput) w osobnym wątku,
+- :class:`MacroRunner` - odtwarzanie makr (sekwencji kroków) w osobnym wątku.
 
-Komunikacja między wątkiem pynput/scrcpy a pętlą zdarzeń PyQt6 odbywa się
-wyłącznie przez sygnały Qt (queued connections) - nasłuch nie blokuje GUI.
+Komunikacja między wątkami (pynput/scrcpy/makro) a pętlą zdarzeń PyQt6
+odbywa się wyłącznie przez sygnały Qt (queued connections) - nasłuch
+i odtwarzanie makr nie blokują GUI.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from typing import Callable
 
 import adbutils
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
@@ -24,9 +27,11 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -34,7 +39,7 @@ from PyQt6.QtWidgets import (
 )
 
 from adb_controller import ADBController, ADBError
-from config_manager import ConfigManager, SwipePoint
+from config_manager import ConfigManager, MacroPoint, SwipePoint
 from stream_widget import AndroidScreenWidget
 
 # Minimalny odstęp między akcjami tego samego klawisza [s] - zabezpieczenie
@@ -44,12 +49,36 @@ TAP_DEBOUNCE_S = 0.05
 _STATUS_TIMEOUT_MS = 6000
 
 
+def _plural_steps(n: int) -> str:
+    """Polska odmiana liczby kroków: 1 krok, 2-4 kroki, 5+ kroków."""
+    if n == 1:
+        return "1 krok"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} kroki"
+    return f"{n} kroków"
+
+
+def _format_action(action: dict) -> str:
+    """Czytelny opis pojedynczego kroku makra (do listy w GUI)."""
+    kind = action.get("type")
+    if kind == "tap":
+        return f"Tap ({action['x']}, {action['y']})"
+    if kind == "swipe":
+        return (
+            f"Swipe ({action['x1']},{action['y1']}) "
+            f"→ ({action['x2']},{action['y2']})"
+        )
+    if kind == "delay":
+        return f"Delay {action.get('ms', 0)} ms"
+    return str(action)
+
+
 class KeymapperEngine(QObject):
     """Globalny nasłuch klawiszy przez pynput w osobnym wątku.
 
     Sygnały (emituje je wątek pynput, odbierają sloty w wątku GUI):
         key_pressed(str): naciśnięto klawisz - slot wywołuje przypisaną
-            akcję (tap lub swipe) na aktywnym urządzeniu.
+            akcję (tap, swipe lub makro) na aktywnym urządzeniu.
         key_captured(str): przechwycono klawisz w trybie dodawania punktu.
         error(str): nie udało się uruchomić nasłuchu.
     """
@@ -154,8 +183,62 @@ class KeymapperEngine(QObject):
         return None
 
 
+class MacroRunner(threading.Thread):
+    """Odtwarza sekwencję kroków makra w osobnym wątku.
+
+    Dzięki osobnemu wątkowi odtwarzanie (w tym ``delay``) nie blokuje
+    pętli zdarzeń PyQt6 ani nasłuchu pynput. Kroki:
+        tap:   ``adb.tap(x, y)``
+        swipe: ``adb.swipe(x1, y1, x2, y2, duration_ms)``
+        delay: pauza przez ``ms`` (przerywalna przez :meth:`stop`)
+
+    Po zakończeniu (lub przerwaniu) wywoływany jest ``finished``.
+    """
+
+    def __init__(
+        self,
+        adb: ADBController,
+        actions: list[dict],
+        finished: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(daemon=True, name="macro-runner")
+        self._adb = adb
+        self._actions = list(actions)
+        self._finished = finished
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        try:
+            for action in self._actions:
+                if self._stop_event.is_set():
+                    break
+                kind = action.get("type")
+                if kind == "delay":
+                    # wait(timeout) zamiast sleep - natychmiastowe przerwanie
+                    self._stop_event.wait(int(action.get("ms", 0)) / 1000.0)
+                elif kind == "tap":
+                    self._adb.tap(int(action["x"]), int(action["y"]))
+                elif kind == "swipe":
+                    self._adb.swipe(
+                        int(action["x1"]),
+                        int(action["y1"]),
+                        int(action["x2"]),
+                        int(action["y2"]),
+                        int(action.get("duration_ms", 300)),
+                    )
+        finally:
+            if self._finished is not None:
+                self._finished()
+
+    def stop(self) -> None:
+        """Przerywa odtwarzanie (bezpieczne z dowolnego wątku)."""
+        self._stop_event.set()
+
+
 class MainWindow(QMainWindow):
     """Główne okno aplikacji: stream + panel sterowania + keymapper."""
+
+    _macro_done = pyqtSignal()
 
     def __init__(self, config_path: str = "keymap.json") -> None:
         super().__init__()
@@ -174,6 +257,8 @@ class MainWindow(QMainWindow):
             "x2": None,
             "y2": None,
         }
+        self._macro_steps: list[dict] = []
+        self._macro_runner: MacroRunner | None = None
 
         self._build_ui()
         self._wire_signals()
@@ -247,11 +332,40 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Dodaj kliknięcie (Tap)", "tap")
         self.mode_combo.addItem("Dodaj przesunięcie (Swipe)", "swipe")
+        self.mode_combo.addItem("Dodaj makro (sekwencja)", "macro")
         mode_row.addWidget(self.mode_combo, 1)
         add_layout.addLayout(mode_row)
+
+        # Tryb Tap/Swipe: gest na ekranie + klawisz
         self.add_mode_check = QCheckBox("Tryb dodawania (narysuj na ekranie, potem klawisz)")
         self.add_hint = QLabel("Nieaktywny.")
         self.add_hint.setWordWrap(True)
+        add_layout.addWidget(self.add_mode_check)
+        add_layout.addWidget(self.add_hint)
+
+        # Tryb Macro: edytor kroków (widoczny tylko przy "macro")
+        self.macro_record_check = QCheckBox(
+            "Nagraj z ekranu (klik = Tap, przeciągnij = Swipe)"
+        )
+        self.macro_steps_list = QListWidget()
+        self.macro_steps_list.setMaximumHeight(160)
+        self.macro_delay_row = QWidget()
+        delay_layout = QHBoxLayout(self.macro_delay_row)
+        delay_layout.setContentsMargins(0, 0, 0, 0)
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(10, 10_000)
+        self.delay_spin.setValue(300)
+        self.delay_spin.setSuffix(" ms")
+        self.delay_button = QPushButton("Dodaj Delay")
+        delay_layout.addWidget(QLabel("Delay:"))
+        delay_layout.addWidget(self.delay_spin, 1)
+        delay_layout.addWidget(self.delay_button)
+        self.macro_remove_step_button = QPushButton("Usuń zaznaczony krok")
+        add_layout.addWidget(self.macro_record_check)
+        add_layout.addWidget(self.macro_steps_list)
+        add_layout.addWidget(self.macro_delay_row)
+        add_layout.addWidget(self.macro_remove_step_button)
+
         name_row = QHBoxLayout()
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Nazwa akcji")
@@ -259,8 +373,6 @@ class MainWindow(QMainWindow):
         self.save_point_button.setEnabled(False)
         name_row.addWidget(self.name_input, 1)
         name_row.addWidget(self.save_point_button)
-        add_layout.addWidget(self.add_mode_check)
-        add_layout.addWidget(self.add_hint)
         add_layout.addLayout(name_row)
         panel_layout.addWidget(add_box)
 
@@ -303,6 +415,9 @@ class MainWindow(QMainWindow):
         self.add_mode_check.toggled.connect(self._on_add_mode_toggled)
         self.save_point_button.clicked.connect(self._on_save_point)
         self.name_input.returnPressed.connect(self._on_save_point)
+        self.macro_record_check.toggled.connect(self._on_macro_record_toggled)
+        self.delay_button.clicked.connect(self._on_add_delay)
+        self.macro_remove_step_button.clicked.connect(self._on_remove_macro_step)
 
         self.keymapper_check.toggled.connect(self._on_keymapper_toggled)
         self.engine.key_pressed.connect(self._on_key_pressed)
@@ -316,6 +431,8 @@ class MainWindow(QMainWindow):
         )
         self.stream.stream_stopped.connect(self._on_stream_stopped)
         self.stream.stream_error.connect(self._status)
+
+        self._macro_done.connect(lambda: self._status("Makro zakończone."))
 
     # ------------------------------------------------------------------
     # Połączenie z urządzeniem
@@ -396,7 +513,11 @@ class MainWindow(QMainWindow):
         for point in points:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            if isinstance(point, SwipePoint):
+            if isinstance(point, MacroPoint):
+                typ = "Macro"
+                x_label = _plural_steps(len(point.actions))
+                y_label = "—"
+            elif isinstance(point, SwipePoint):
                 typ = "Swipe"
                 x_label = f"{point.x1} → {point.x2}"
                 y_label = f"{point.y1} → {point.y2}"
@@ -428,13 +549,28 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _gesture_kind(self) -> str:
-        """Rodzaj akcji wybranej w panelu dodawania: ``"tap"`` lub ``"swipe"``."""
+        """Rodzaj akcji wybranej w panelu dodawania: "tap", "swipe" lub "macro"."""
         return str(self.mode_combo.currentData() or "tap")
 
     def _on_mode_changed(self) -> None:
-        self.stream.set_gesture_mode(self._gesture_kind())
+        kind = self._gesture_kind()
+        # Macro używa streamu w trybie "swipe": klik -> Tap, przeciągnięcie -> Swipe
+        self.stream.set_gesture_mode("swipe" if kind in ("swipe", "macro") else "tap")
+        self._set_macro_editor_visible(kind == "macro")
+        self.save_point_button.setText("Zapisz Makro" if kind == "macro" else "Zapisz akcję")
         self._reset_pending()
+        self._macro_steps = []
+        self._refresh_macro_steps()
         self._update_add_hint()
+
+    def _set_macro_editor_visible(self, visible: bool) -> None:
+        """Przełącza widoczność edytora kroków makra vs. trybu Tap/Swipe."""
+        self.macro_record_check.setVisible(visible)
+        self.macro_steps_list.setVisible(visible)
+        self.macro_delay_row.setVisible(visible)
+        self.macro_remove_step_button.setVisible(visible)
+        self.add_mode_check.setVisible(not visible)
+        self.add_hint.setVisible(not visible)
 
     def _on_add_mode_toggled(self, checked: bool) -> None:
         self.engine.set_add_mode(checked)
@@ -452,35 +588,87 @@ class MainWindow(QMainWindow):
             self.add_hint.setText("Nieaktywny.")
         self._update_engine()
 
+    def _on_macro_record_toggled(self, checked: bool) -> None:
+        self.engine.set_add_mode(checked)
+        self._update_engine()
+        self._update_add_hint()
+
     def _on_screen_clicked(self, x: int, y: int) -> None:
-        if not self.add_mode_check.isChecked() or self._gesture_kind() != "tap":
+        kind = self._gesture_kind()
+        if kind == "macro":
+            if self.macro_record_check.isChecked():
+                from config_manager import tap_action
+
+                self._macro_steps.append(tap_action(x, y))
+                self._refresh_macro_steps()
+                self._update_add_hint()
+            return
+        if not self.add_mode_check.isChecked() or kind != "tap":
             return
         self._pending["x"], self._pending["y"] = x, y
         self._update_add_hint()
 
     def _on_swipe_selected(self, x1: int, y1: int, x2: int, y2: int) -> None:
-        if not self.add_mode_check.isChecked() or self._gesture_kind() != "swipe":
+        kind = self._gesture_kind()
+        if kind == "macro":
+            if self.macro_record_check.isChecked():
+                from config_manager import swipe_action
+
+                self._macro_steps.append(swipe_action(x1, y1, x2, y2))
+                self._refresh_macro_steps()
+                self._update_add_hint()
+            return
+        if not self.add_mode_check.isChecked() or kind != "swipe":
             return
         self._pending["x1"], self._pending["y1"] = x1, y1
         self._pending["x2"], self._pending["y2"] = x2, y2
         self._update_add_hint()
 
+    def _on_add_delay(self) -> None:
+        from config_manager import delay_action
+
+        self._macro_steps.append(delay_action(self.delay_spin.value()))
+        self._refresh_macro_steps()
+        self._update_add_hint()
+
+    def _on_remove_macro_step(self) -> None:
+        row = self.macro_steps_list.currentRow()
+        if row < 0 or row >= len(self._macro_steps):
+            return
+        del self._macro_steps[row]
+        self._refresh_macro_steps()
+        self._update_add_hint()
+
+    def _refresh_macro_steps(self) -> None:
+        """Odświeża listę kroków makra w GUI."""
+        self.macro_steps_list.clear()
+        for i, action in enumerate(self._macro_steps, start=1):
+            self.macro_steps_list.addItem(f"{i}. {_format_action(action)}")
+
     def _on_key_captured(self, key: str) -> None:
-        if not self.add_mode_check.isChecked():
+        kind = self._gesture_kind()
+        if kind == "macro":
+            if not self.macro_record_check.isChecked():
+                return
+        elif not self.add_mode_check.isChecked():
             return
         self._pending["key"] = key
         self._update_add_hint()
 
     def _update_add_hint(self) -> None:
         p = self._pending
-        if self._gesture_kind() == "swipe":
+        if self._gesture_kind() == "macro":
+            if self._macro_steps:
+                steps = [f"nagrano {_plural_steps(len(self._macro_steps))}"]
+            else:
+                steps = ["dodaj kroki (klik/przeciągnij na ekranie lub Delay)"]
+            gesture_ready = len(self._macro_steps) > 0
+        elif self._gesture_kind() == "swipe":
             if p["x1"] is not None:
                 steps = [f"start ({p['x1']}, {p['y1']})", f"koniec ({p['x2']}, {p['y2']})"]
             else:
                 steps = ["przeciągnij na ekranie (start → koniec)"]
-            gesture_ready = all(
-                p[k] is not None for k in ("x1", "y1", "x2", "y2")
-            )
+            gesture_ready = all(p[k] is not None for k in ("x1", "y1", "x2", "y2"))
         else:
             if p["x"] is not None:
                 steps = [f"X={p['x']}, Y={p['y']}"]
@@ -504,6 +692,26 @@ class MainWindow(QMainWindow):
             self._status("Najpierw wciśnij klawisz.")
             return
         key = p["key"]
+
+        if self._gesture_kind() == "macro":
+            if not self._macro_steps:
+                self._status("Dodaj co najmniej jeden krok makra.")
+                return
+            try:
+                self.config.add_macro(name, key, self._macro_steps)
+            except ValueError as exc:
+                self._status(f"Nie zapisano: {exc}")
+                return
+            count = len(self._macro_steps)
+            self._reload_points()
+            self.name_input.clear()
+            self.macro_record_check.setChecked(False)  # wyłącza nagrywanie
+            self._macro_steps = []
+            self._refresh_macro_steps()
+            self._status(
+                f"Zapisano makro '{name}' -> klawisz {key} ({_plural_steps(count)})"
+            )
+            return
 
         if self._gesture_kind() == "swipe":
             if any(p[k] is None for k in ("x1", "y1", "x2", "y2")):
@@ -550,7 +758,7 @@ class MainWindow(QMainWindow):
         self.save_point_button.setEnabled(False)
 
     # ------------------------------------------------------------------
-    # Keymapper
+    # Keymapper / Makra
     # ------------------------------------------------------------------
 
     def _on_keymapper_toggled(self, checked: bool) -> None:
@@ -558,8 +766,12 @@ class MainWindow(QMainWindow):
         self._status("Keymapper aktywny." if checked else "Keymapper wyłączony.")
 
     def _update_engine(self) -> None:
-        """Nasłuch działa, gdy włączony jest keymapper LUB tryb dodawania."""
-        should_run = self.keymapper_check.isChecked() or self.add_mode_check.isChecked()
+        """Nasłuch działa, gdy włączony jest keymapper LUB dowolny tryb dodawania."""
+        should_run = (
+            self.keymapper_check.isChecked()
+            or self.add_mode_check.isChecked()
+            or self.macro_record_check.isChecked()
+        )
         if should_run and not self.engine.is_running:
             self.engine.start()
         elif not should_run and self.engine.is_running:
@@ -569,7 +781,9 @@ class MainWindow(QMainWindow):
         point = self.config.get_point(key)
         if point is None or self.adb.device_serial is None:
             return
-        if isinstance(point, SwipePoint):
+        if isinstance(point, MacroPoint):
+            self._start_macro(point)
+        elif isinstance(point, SwipePoint):
             if not self.adb.swipe(
                 point.x1, point.y1, point.x2, point.y2, point.duration_ms
             ):
@@ -577,9 +791,29 @@ class MainWindow(QMainWindow):
         elif not self.adb.tap(point.x, point.y):
             self._status(f"Tap nieudany dla klawisza '{key}'")
 
+    def _start_macro(self, point: MacroPoint) -> None:
+        """Uruchamia odtwarzanie makra w osobnym wątku (nie blokuje GUI)."""
+        if self.adb.device_serial is None:
+            return
+        if self._macro_runner is not None and self._macro_runner.is_alive():
+            self._status(f"Makro już trwa - pomijam klawisz '{point.key}'")
+            return
+        self._macro_runner = MacroRunner(
+            self.adb, point.actions, finished=self._macro_finished
+        )
+        self._macro_runner.start()
+        self._status(
+            f"Odtwarzam makro '{point.name}' ({_plural_steps(len(point.actions))})"
+        )
+
+    def _macro_finished(self) -> None:
+        """Wywoływany z wątku roboczego - bezpieczne przejście do wątku GUI."""
+        self._macro_done.emit()
+
     def _on_engine_error(self, message: str) -> None:
         self.keymapper_check.setChecked(False)
         self.add_mode_check.setChecked(False)
+        self.macro_record_check.setChecked(False)
         self._status(message)
 
     # ------------------------------------------------------------------
@@ -594,6 +828,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, _STATUS_TIMEOUT_MS)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if self._macro_runner is not None:
+            self._macro_runner.stop()
         self.engine.stop()
         self.stream.stop_stream()
         super().closeEvent(event)

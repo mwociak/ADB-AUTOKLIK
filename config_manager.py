@@ -1,8 +1,8 @@
 """ConfigManager - zarządzanie profilem mapowania punktów (keymap).
 
 Klasa :class:`ConfigManager` zapisuje i odczytuje profil mapowania
-klawiszy laptopa na akcje symulowane na ekranie Androida (dotknięcia
-oraz gesty przesunięcia) w pliku ``keymap.json``.
+klawiszy laptopa na akcje symulowane na ekranie Androida (dotknięcia,
+gesty przesunięcia oraz makra - sekwencje kroków) w pliku ``keymap.json``.
 
 Format pliku JSON::
 
@@ -10,7 +10,13 @@ Format pliku JSON::
       "points": [
         {"kind": "tap", "name": "Skill 1", "key": "a", "x": 450, "y": 1200},
         {"kind": "swipe", "name": "Dash", "key": "space",
-         "x1": 900, "y1": 1500, "x2": 300, "y2": 1500, "duration_ms": 300}
+         "x1": 900, "y1": 1500, "x2": 300, "y2": 1500, "duration_ms": 300},
+        {"kind": "macro", "name": "Combo", "key": "q", "actions": [
+          {"type": "tap", "x": 450, "y": 1200},
+          {"type": "delay", "ms": 150},
+          {"type": "swipe", "x1": 900, "y1": 1500, "x2": 300, "y2": 1500,
+           "duration_ms": 300}
+        ]}
       ]
     }
 
@@ -25,8 +31,57 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Union
 
-# Jeden klawisz = jedna akcja (tap LUB swipe) - unia obu typów punktów.
-AnyPoint = Union["KeyPoint", "SwipePoint"]
+# Pojedynczy krok makra: słownik {"type": "tap"|"swipe"|"delay", ...}.
+Action = dict[str, Any]
+
+# Jeden klawisz = jedna akcja (tap, swipe LUB makro) - unia typów punktów.
+AnyPoint = Union["KeyPoint", "SwipePoint", "MacroPoint"]
+
+
+def tap_action(x: int, y: int) -> Action:
+    """Buduje krok makra typu tap."""
+    return {"type": "tap", "x": int(x), "y": int(y)}
+
+
+def swipe_action(
+    x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300
+) -> Action:
+    """Buduje krok makra typu swipe."""
+    return {
+        "type": "swipe",
+        "x1": int(x1),
+        "y1": int(y1),
+        "x2": int(x2),
+        "y2": int(y2),
+        "duration_ms": max(0, int(duration_ms)),
+    }
+
+
+def delay_action(ms: int) -> Action:
+    """Buduje krok makra typu delay (pauza w milisekundach)."""
+    return {"type": "delay", "ms": max(0, int(ms))}
+
+
+def normalize_action(data: dict[str, Any]) -> Action:
+    """Waliduje i uzupełnia pojedynczy krok makra.
+
+    Odporne na brakujące pola (uzupełnia zera / domyślne wartości).
+    Nieznany typ kroku zgłasza ``ValueError``.
+    """
+    kind = str(data.get("type", "")).lower()
+    if kind == "tap":
+        return tap_action(int(data.get("x", 0)), int(data.get("y", 0)))
+    if kind == "swipe":
+        return swipe_action(
+            int(data.get("x1", 0)),
+            int(data.get("y1", 0)),
+            int(data.get("x2", 0)),
+            int(data.get("y2", 0)),
+            int(data.get("duration_ms", 300)),
+        )
+    if kind == "delay":
+        return delay_action(int(data.get("ms", 0)))
+    raise ValueError(f"Nieznany typ kroku makra: {kind!r}")
 
 
 @dataclass
@@ -91,14 +146,66 @@ class SwipePoint:
         )
 
 
+@dataclass
+class MacroPoint:
+    """Punkt mapowania typu macro: klawisz laptopa -> sekwencja kroków.
+
+    ``actions`` to lista słowników kroków w kolejności wykonania
+    (patrz :func:`tap_action`, :func:`swipe_action`, :func:`delay_action`):
+    ``{"type": "tap", "x": ..., "y": ...}``,
+    ``{"type": "swipe", "x1": ..., "y1": ..., "x2": ..., "y2": ...,
+    "duration_ms": ...}``,
+    ``{"type": "delay", "ms": ...}``.
+    """
+
+    name: str
+    key: str
+    actions: list[Action]
+
+    KIND = "macro"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializacja punktu do słownika (format pliku JSON)."""
+        return {
+            "kind": self.KIND,
+            "name": self.name,
+            "key": self.key,
+            "actions": self.actions,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MacroPoint":
+        """Deserializacja punktu ze słownika.
+
+        Niepoprawne kroki (nieznany typ, zły format) są pomijane zamiast
+        psuć cały profil.
+        """
+        actions: list[Action] = []
+        for entry in data.get("actions", []):
+            if isinstance(entry, dict):
+                try:
+                    actions.append(normalize_action(entry))
+                except ValueError:
+                    continue
+        return cls(
+            name=str(data.get("name", "")).strip(),
+            key=str(data.get("key", "")).strip().lower(),
+            actions=actions,
+        )
+
+
 def _point_from_dict(data: dict[str, Any]) -> AnyPoint:
     """Buduje punkt ze słownika JSON.
 
-    Wpis z ``kind == \"swipe\"`` staje się :class:`SwipePoint`; każdy inny
-    (w tym stary format bez pola ``kind``) - :class:`KeyPoint` (tap).
+    Wpis z ``kind == "swipe"`` staje się :class:`SwipePoint`,
+    ``kind == "macro"`` - :class:`MacroPoint`; każdy inny (w tym stary
+    format bez pola ``kind``) - :class:`KeyPoint` (tap).
     """
-    if str(data.get("kind", "")).lower() == SwipePoint.KIND:
+    kind = str(data.get("kind", "")).lower()
+    if kind == SwipePoint.KIND:
         return SwipePoint.from_dict(data)
+    if kind == MacroPoint.KIND:
+        return MacroPoint.from_dict(data)
     return KeyPoint.from_dict(data)
 
 
@@ -116,9 +223,10 @@ class ConfigManager:
     def load_config(self) -> list[AnyPoint]:
         """Wczytuje punkty z pliku JSON.
 
-        Zwraca listę punktów (tapów i swipe'ów). Jeśli plik nie istnieje,
-        zwraca pustą listę (a nie rzuca wyjątku). Przy uszkodzonym JSON
-        rzuca ``ValueError``. Stare wpisy bez ``kind`` traktowane są jako tap.
+        Zwraca listę punktów (tapy, swipe'y i makra). Jeśli plik nie
+        istnieje, zwraca pustą listę (a nie rzuca wyjątku). Przy
+        uszkodzonym JSON rzuca ``ValueError``. Stare wpisy bez ``kind``
+        traktowane są jako tap.
         """
         self.points = []
         if not self.config_path.exists():
@@ -157,8 +265,8 @@ class ConfigManager:
         """Dodaje punkt dotknięcia (tap) do profilu i zapisuje konfigurację.
 
         Jeśli istnieje już akcja przypisana do tego samego klawisza
-        (tap lub swipe), zostaje ona zastąpiona nową (jeden klawisz =
-        jedna akcja).
+        (tap, swipe lub makro), zostaje ona zastąpiona nową (jeden
+        klawisz = jedna akcja).
         """
         name = name.strip()
         key = key.strip().lower()
@@ -209,8 +317,34 @@ class ConfigManager:
         self.save_config()
         return point
 
+    def add_macro(self, name: str, key: str, actions: list[Action]) -> MacroPoint:
+        """Dodaje makro (sekwencję kroków) do profilu i zapisuje konfigurację.
+
+        Kroki są walidowane przez :func:`normalize_action` - nieznany typ
+        zgłasza ``ValueError``. Analogicznie do pozostałych metod - dodanie
+        makra nadpisuje dotychczasowe mapowanie tego samego klawisza.
+        """
+        name = name.strip()
+        key = key.strip().lower()
+        if not name:
+            raise ValueError("Nazwa akcji nie może być pusta")
+        if not key:
+            raise ValueError("Klawisz nie może być pusty")
+        if not actions:
+            raise ValueError("Makro musi zawierać co najmniej jeden krok")
+
+        point = MacroPoint(
+            name=name,
+            key=key,
+            actions=[normalize_action(action) for action in actions],
+        )
+        self.points = [p for p in self.points if p.key != key]
+        self.points.append(point)
+        self.save_config()
+        return point
+
     def remove_point(self, name_or_key: str | int) -> bool:
-        """Usuwa punkt (tap lub swipe) po nazwie, klawiszu lub indeksie.
+        """Usuwa punkt (tap, swipe lub makro) po nazwie, klawiszu lub indeksie.
 
         Zwraca ``True``, jeśli punkt został usunięty, ``False`` w przeciwnym
         razie (np. nie znaleziono). Konfiguracja jest zapisywana tylko
@@ -238,7 +372,7 @@ class ConfigManager:
     # ------------------------------------------------------------------
 
     def get_point(self, name_or_key: str) -> AnyPoint | None:
-        """Zwraca punkt (tap lub swipe) po nazwie lub klawiszu, albo ``None``."""
+        """Zwraca punkt (tap, swipe lub makro) po nazwie lub klawiszu, albo ``None``."""
         target = name_or_key.strip().lower()
         for point in self.points:
             if point.name.lower() == target or point.key == target:
