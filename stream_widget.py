@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import QWidget
 # serial - używamy wariantu z serialem (spójnie z ADBController).
 from scrcpy import Client
 
-from config_manager import KeyPoint, MacroPoint, SwipePoint
+from config_manager import AnyPoint, KeyPoint, MacroPoint, SwipePoint
 
 # Domyślne parametry streamu: pełna rozdzielczość telefonu (max_width=0),
 # ograniczone fps (oszczędność CPU/bandwidth), klatki tylko gdy nowe.
@@ -51,6 +51,8 @@ _DRAG_PREVIEW = QColor(255, 255, 255, 170)
 _SWIPE_END_RADIUS = 5.0
 # Minimalne przesunięcie myszy [px], aby uznać gest za swipe (a nie klik).
 _SWIPE_MIN_DRAG_PX = 10
+# Promień trafienia [px] przy chwytaniu punktu nakładki (drag & drop).
+_DRAG_HIT_RADIUS = 26.0
 
 
 class AndroidScreenWidget(QWidget):
@@ -74,6 +76,7 @@ class AndroidScreenWidget(QWidget):
 
     point_selected = pyqtSignal(int, int)
     swipe_selected = pyqtSignal(int, int, int, int)
+    point_moved = pyqtSignal(str, int, int)  # (name, new_x, new_y) - drag & drop nakładki
     stream_started = pyqtSignal(str)
     stream_stopped = pyqtSignal(str)
     stream_error = pyqtSignal(str)
@@ -110,6 +113,13 @@ class AndroidScreenWidget(QWidget):
         self._gesture_mode = "tap"
         self._drag_start: QPointF | None = None  # pozycja wciśnięcia LPM (widżet)
         self._drag_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
+
+        # Drag & drop punktów nakładki (aktywne, gdy przechwytywanie gestów wyłączone)
+        self._capture_enabled = False
+        self._move_point: KeyPoint | SwipePoint | MacroPoint | None = None
+        self._move_start: QPointF | None = None  # pozycja wciśnięcia (widżet)
+        self._move_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
+        self._move_origin: tuple[int, int] | None = None  # oryginalna kotwica (telefon)
 
         self._frame_received.connect(self._on_frame_gui)
         self.setMouseTracking(True)
@@ -257,6 +267,9 @@ class AndroidScreenWidget(QWidget):
                     _DRAG_PREVIEW,
                     width=2.0,
                 )
+            # Podgląd przeciągania punktu nakładki (drag & drop)
+            if self._move_point is not None and self._move_current is not None:
+                self._draw_move_ghost(painter)
         else:
             painter.setPen(QColor(140, 155, 170))
             painter.drawText(
@@ -287,6 +300,12 @@ class AndroidScreenWidget(QWidget):
 
     def _draw_macro_overlay(self, painter: QPainter, point: MacroPoint) -> None:
         """Rysuje kroki makra: tapy (kółka), swipe'y (strzałki), klawisz przy pierwszym kroku."""
+        self._draw_macro_overlay_at(painter, point, 0.0, 0.0)
+
+    def _draw_macro_overlay_at(
+        self, painter: QPainter, point: MacroPoint, dx: float, dy: float
+    ) -> None:
+        """Rysuje kroki makra przesunięte o (dx, dy) px (używane przy drag & drop)."""
         if self._phone_size is None:
             return
         first: tuple[float, float] | None = None
@@ -294,6 +313,7 @@ class AndroidScreenWidget(QWidget):
             kind = action.get("type")
             if kind == "tap":
                 x, y = self._to_widget(int(action["x"]), int(action["y"]))
+                x, y = x + dx, y + dy
                 if first is None:
                     first = (x, y)
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -302,6 +322,8 @@ class AndroidScreenWidget(QWidget):
             elif kind == "swipe":
                 sx, sy = self._to_widget(int(action["x1"]), int(action["y1"]))
                 ex, ey = self._to_widget(int(action["x2"]), int(action["y2"]))
+                sx, sy = sx + dx, sy + dy
+                ex, ey = ex + dx, ey + dy
                 if first is None:
                     first = (sx, sy)
                 self._draw_overlay_arrow(
@@ -377,27 +399,76 @@ class AndroidScreenWidget(QWidget):
         self._drag_current = None
         self.update()
 
+    def set_capture_enabled(self, enabled: bool) -> None:
+        """Włącza/wyłącza przechwytywanie gestów myszy do definiowania akcji.
+
+        Gdy przechwytywanie jest włączone (tryb dodawania tap/swipe lub
+        nagrywanie makra), kliknięcia/przeciągnięcia na ekranie są
+        zamieniane na sygnały :attr:`point_selected` / :attr:`swipe_selected`.
+        Gdy wyłączone - mysz służy do chwytania i przeciągania punktów
+        nakładki (drag & drop; patrz :attr:`point_moved`).
+        """
+        self._capture_enabled = bool(enabled)
+        self._drag_start = None
+        self._drag_current = None
+        self._move_point = None
+        self._move_start = None
+        self._move_current = None
+        self.update()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._gesture_mode == "swipe":
-                self._drag_start = event.position()
-                self._drag_current = event.position()
-                self.update()
+            if self._capture_enabled:
+                if self._gesture_mode == "swipe":
+                    self._drag_start = event.position()
+                    self._drag_current = event.position()
+                    self.update()
+                else:
+                    phone = self._to_phone(event.position())
+                    if phone is not None:
+                        self.point_selected.emit(*phone)
             else:
-                phone = self._to_phone(event.position())
-                if phone is not None:
-                    self.point_selected.emit(*phone)
+                point = self._hit_test_point(event.position())
+                if point is not None:
+                    self._move_point = point
+                    self._move_start = event.position()
+                    self._move_current = event.position()
+                    self._move_origin = self._point_anchor_phone(point)
+                    self.update()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
-        if self._gesture_mode == "swipe" and self._drag_start is not None:
+        if self._move_point is not None:
+            self._move_current = event.position()
+            self.update()
+        elif self._capture_enabled and self._gesture_mode == "swipe" and self._drag_start is not None:
             self._drag_current = event.position()
             self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if event.button() == Qt.MouseButton.LeftButton and self._move_point is not None:
+            point = self._move_point
+            start = self._move_start
+            end = event.position()
+            self._move_point = None
+            self._move_current = None
+            self.update()
+            if start is None:
+                return
+            dx_w = end.x() - start.x()
+            dy_w = end.y() - start.y()
+            dx, dy = self._widget_delta_to_phone(dx_w, dy_w)
+            origin = self._move_origin
+            if origin is None:
+                return
+            nx, ny = self._clamp_phone(origin[0] + round(dx), origin[1] + round(dy))
+            if (nx, ny) != origin:
+                self.point_moved.emit(point.name, nx, ny)
+            return
         if (
-            self._gesture_mode == "swipe"
+            self._capture_enabled
+            and self._gesture_mode == "swipe"
             and self._drag_start is not None
             and event.button() == Qt.MouseButton.LeftButton
         ):
@@ -415,6 +486,94 @@ class AndroidScreenWidget(QWidget):
             else:
                 self.point_selected.emit(*p1)  # klik bez przeciągnięcia = tap
         super().mouseReleaseEvent(event)
+
+    # ------------------------------------------------------------------
+    # Drag & drop punktów nakładki
+    # ------------------------------------------------------------------
+
+    def _point_anchor_phone(self, point: AnyPoint) -> tuple[int, int] | None:
+        """Kotwica punktu w współrzędnych telefonu (kółko chwytane myszą).
+
+        Dla makra jest to pierwszy krok tap/swipe - spójnie z rysowaniem
+        klawisza na nakładce.
+        """
+        if isinstance(point, KeyPoint):
+            return (point.x, point.y)
+        if isinstance(point, SwipePoint):
+            return (point.x1, point.y1)
+        if isinstance(point, MacroPoint):
+            for action in point.actions:
+                kind = action.get("type")
+                if kind == "tap":
+                    return (int(action["x"]), int(action["y"]))
+                if kind == "swipe":
+                    return (int(action["x1"]), int(action["y1"]))
+        return None
+
+    def _point_anchor_widget(self, point: AnyPoint) -> tuple[float, float] | None:
+        """Kotwica punktu w współrzędnych widżetu (do trafienia myszą)."""
+        anchor = self._point_anchor_phone(point)
+        if anchor is None:
+            return None
+        return self._to_widget(*anchor)
+
+    def _hit_test_point(self, pos: QPointF) -> AnyPoint | None:
+        """Zwraca punkt nakładki, którego kółko zawiera pozycję myszy (albo ``None``)."""
+        if self._phone_size is None or self._draw_rect.isNull():
+            return None
+        best: AnyPoint | None = None
+        best_dist = _DRAG_HIT_RADIUS
+        for point in self._overlay_points:
+            anchor = self._point_anchor_widget(point)
+            if anchor is None:
+                continue
+            dist = math.hypot(pos.x() - anchor[0], pos.y() - anchor[1])
+            if dist < best_dist:
+                best, best_dist = point, dist
+        return best
+
+    def _widget_delta_to_phone(self, dx: float, dy: float) -> tuple[float, float]:
+        """Przelicza przesunięcie myszy [px widżetu] na różnicę w współrzędnych telefonu."""
+        if self._phone_size is None or self._draw_rect.isNull():
+            return (0.0, 0.0)
+        pw, ph = self._phone_size
+        r = self._draw_rect
+        return (dx / r.width() * pw, dy / r.height() * ph)
+
+    def _clamp_phone(self, x: int, y: int) -> tuple[int, int]:
+        """Ogranicza współrzędne telefonu do rozmiaru ekranu."""
+        if self._phone_size is None:
+            return (x, y)
+        pw, ph = self._phone_size
+        return (min(max(x, 0), pw - 1), min(max(y, 0), ph - 1))
+
+    def _draw_move_ghost(self, painter: QPainter) -> None:
+        """Rysuje "ducha" przeciąganego punktu (podąża za myszą)."""
+        point = self._move_point
+        current = self._move_current
+        start = self._move_start
+        if point is None or current is None or start is None:
+            return
+        dx = current.x() - start.x()
+        dy = current.y() - start.y()
+        if isinstance(point, KeyPoint):
+            self._draw_overlay_circle(
+                painter, current.x(), current.y(), point.key
+            )
+        elif isinstance(point, SwipePoint):
+            sx, sy = self._to_widget(point.x1, point.y1)
+            ex, ey = self._to_widget(point.x2, point.y2)
+            self._draw_overlay_arrow(
+                painter, (sx + dx, sy + dy), (ex + dx, ey + dy), _SWIPE_ARROW
+            )
+            self._draw_overlay_circle(painter, sx + dx, sy + dy, point.key)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(_OVERLAY_BORDER)
+            painter.drawEllipse(
+                QPointF(ex + dx, ey + dy), _SWIPE_END_RADIUS, _SWIPE_END_RADIUS
+            )
+        elif isinstance(point, MacroPoint):
+            self._draw_macro_overlay_at(painter, point, dx, dy)
 
     def _to_phone(self, pos: QPointF) -> tuple[int, int] | None:
         """Przelicza pozycję w widżecie na współrzędne telefonu.

@@ -378,3 +378,59 @@ class ConfigManager:
             if point.name.lower() == target or point.key == target:
                 return point
         return None
+
+    def move_point(self, name: str, new_x: int, new_y: int) -> bool:
+        """Przesuwa akcję o nazwie ``name`` do nowego punktu i zapisuje plik.
+
+        Dla :class:`KeyPoint` ustawia (x, y) = (new_x, new_y). Dla
+        :class:`SwipePoint` przesuwa cały gest o wektor wyznaczony z nowej
+        pozycji punktu startowego (zachowując kierunek i długość). Dla
+        :class:`MacroPoint` przesuwa wszystkie kroki tap/swipe o ten sam
+        wektor (``new_x``/``new_y`` to nowa pozycja pierwszego kotwicy
+        makra). Zwraca ``True``, jeśli akcja została znaleziona i
+        przesunięta; ``False`` w przeciwnym razie.
+        """
+        target = name.strip().lower()
+        for point in self.points:
+            if point.name.lower() != target:
+                continue
+            if isinstance(point, KeyPoint):
+                point.x, point.y = int(new_x), int(new_y)
+            elif isinstance(point, SwipePoint):
+                dx = int(new_x) - point.x1
+                dy = int(new_y) - point.y1
+                point.x1, point.y1 = int(new_x), int(new_y)
+                point.x2 = max(0, point.x2 + dx)
+                point.y2 = max(0, point.y2 + dy)
+            elif isinstance(point, MacroPoint):
+                anchor = self._macro_anchor(point)
+                if anchor is None:
+                    return False
+                dx = int(new_x) - anchor[0]
+                dy = int(new_y) - anchor[1]
+                for action in point.actions:
+                    kind = action.get("type")
+                    if kind == "tap":
+                        action["x"] = max(0, int(action["x"]) + dx)
+                        action["y"] = max(0, int(action["y"]) + dy)
+                    elif kind == "swipe":
+                        action["x1"] = max(0, int(action["x1"]) + dx)
+                        action["y1"] = max(0, int(action["y1"]) + dy)
+                        action["x2"] = max(0, int(action["x2"]) + dx)
+                        action["y2"] = max(0, int(action["y2"]) + dy)
+            else:
+                return False
+            self.save_config()
+            return True
+        return False
+
+    @staticmethod
+    def _macro_anchor(point: MacroPoint) -> tuple[int, int] | None:
+        """Kotwica makra: współrzędne pierwszego kroku tap/swipe (albo ``None``)."""
+        for action in point.actions:
+            kind = action.get("type")
+            if kind == "tap":
+                return (int(action["x"]), int(action["y"]))
+            if kind == "swipe":
+                return (int(action["x1"]), int(action["y1"]))
+        return None
