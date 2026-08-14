@@ -2,8 +2,8 @@
 
 Integruje wszystkie warstwy projektu:
 - :class:`AndroidScreenWidget` - podgląd ekranu telefonu (scrcpy) z nakładką,
-- :class:`ADBController` - komunikacja ADB (dotknięcia),
-- :class:`ConfigManager` - profile punktów mapowania (keymap.json),
+- :class:`ADBController` - komunikacja ADB (dotknięcia i swipe'y),
+- :class:`ConfigManager` - profile akcji mapowania (keymap.json),
 - :class:`KeymapperEngine` - globalny nasłuch klawiszy (pynput) w osobnym wątku.
 
 Komunikacja między wątkiem pynput/scrcpy a pętlą zdarzeń PyQt6 odbywa się
@@ -34,10 +34,10 @@ from PyQt6.QtWidgets import (
 )
 
 from adb_controller import ADBController, ADBError
-from config_manager import ConfigManager
+from config_manager import ConfigManager, SwipePoint
 from stream_widget import AndroidScreenWidget
 
-# Minimalny odstęp między tapami tego samego klawisza [s] - zabezpieczenie
+# Minimalny odstęp między akcjami tego samego klawisza [s] - zabezpieczenie
 # przed "spamowaniem" (edge-trigger + debounce przy szybkim ponownym wciśnięciu).
 TAP_DEBOUNCE_S = 0.05
 
@@ -48,8 +48,8 @@ class KeymapperEngine(QObject):
     """Globalny nasłuch klawiszy przez pynput w osobnym wątku.
 
     Sygnały (emituje je wątek pynput, odbierają sloty w wątku GUI):
-        key_pressed(str): naciśnięto klawisz - slot wywołuje ``tap`` na
-            aktywnym urządzeniu (jeśli klawisz ma przypisany punkt).
+        key_pressed(str): naciśnięto klawisz - slot wywołuje przypisaną
+            akcję (tap lub swipe) na aktywnym urządzeniu.
         key_captured(str): przechwycono klawisz w trybie dodawania punktu.
         error(str): nie udało się uruchomić nasłuchu.
     """
@@ -105,7 +105,7 @@ class KeymapperEngine(QObject):
             self._last_tap.clear()
 
     def set_add_mode(self, active: bool) -> None:
-        """W trybie dodawania przechwytujemy klawisz zamiast wykonywać tap."""
+        """W trybie dodawania przechwytujemy klawisz zamiast wykonywać akcję."""
         self._add_mode = active
 
     # ------------------------------------------------------------------
@@ -121,7 +121,7 @@ class KeymapperEngine(QObject):
                 self.key_captured.emit(name)
                 return
             if name in self._pressed:
-                return  # edge-trigger: przytrzymanie nie powiela tapów
+                return  # edge-trigger: przytrzymanie nie powiela akcji
             self._pressed.add(name)
             now = time.monotonic()
             if now - self._last_tap.get(name, 0.0) < TAP_DEBOUNCE_S:
@@ -165,12 +165,21 @@ class MainWindow(QMainWindow):
         self.config = ConfigManager(config_path)
         self.adb = ADBController()
         self.engine = KeymapperEngine(self)
-        self._pending = {"x": None, "y": None, "key": None}
+        self._pending = {
+            "key": None,
+            "x": None,
+            "y": None,
+            "x1": None,
+            "y1": None,
+            "x2": None,
+            "y2": None,
+        }
 
         self._build_ui()
         self._wire_signals()
         self.refresh_devices()
         self._reload_points()
+        self._on_mode_changed()  # synchronizuje tryb streamu i podpowiedź
 
     # ------------------------------------------------------------------
     # Budowa UI
@@ -211,35 +220,42 @@ class MainWindow(QMainWindow):
         conn_layout.addLayout(wireless_row)
         panel_layout.addWidget(conn_box)
 
-        # --- Punkty mapowania ---
-        points_box = QGroupBox("Punkty mapowania")
+        # --- Akcje mapowania ---
+        points_box = QGroupBox("Akcje mapowania")
         points_layout = QVBoxLayout(points_box)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Nazwa", "Klawisz", "X", "Y"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Typ", "Nazwa", "Klawisz", "X", "Y"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, header.ResizeMode.Stretch)
-        for col in (1, 2, 3):
+        header.setSectionResizeMode(1, header.ResizeMode.Stretch)
+        for col in (0, 2, 3, 4):
             header.setSectionResizeMode(col, header.ResizeMode.ResizeToContents)
-        self.delete_button = QPushButton("Usuń zaznaczony punkt")
+        self.delete_button = QPushButton("Usuń zaznaczoną akcję")
         self.delete_button.setEnabled(False)
         points_layout.addWidget(self.table, 1)
         points_layout.addWidget(self.delete_button)
         panel_layout.addWidget(points_box, 1)
 
-        # --- Dodawanie punktu ---
-        add_box = QGroupBox("Dodaj nowy punkt")
+        # --- Dodawanie akcji ---
+        add_box = QGroupBox("Dodaj nową akcję")
         add_layout = QVBoxLayout(add_box)
-        self.add_mode_check = QCheckBox("Tryb dodawania (kliknij na ekranie, potem klawisz)")
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Typ akcji:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Dodaj kliknięcie (Tap)", "tap")
+        self.mode_combo.addItem("Dodaj przesunięcie (Swipe)", "swipe")
+        mode_row.addWidget(self.mode_combo, 1)
+        add_layout.addLayout(mode_row)
+        self.add_mode_check = QCheckBox("Tryb dodawania (narysuj na ekranie, potem klawisz)")
         self.add_hint = QLabel("Nieaktywny.")
         self.add_hint.setWordWrap(True)
         name_row = QHBoxLayout()
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Nazwa punktu")
-        self.save_point_button = QPushButton("Zapisz punkt")
+        self.name_input.setPlaceholderText("Nazwa akcji")
+        self.save_point_button = QPushButton("Zapisz akcję")
         self.save_point_button.setEnabled(False)
         name_row.addWidget(self.name_input, 1)
         name_row.addWidget(self.save_point_button)
@@ -283,6 +299,7 @@ class MainWindow(QMainWindow):
 
         self.table.itemSelectionChanged.connect(self._on_table_selection)
         self.delete_button.clicked.connect(self._on_delete_point)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.add_mode_check.toggled.connect(self._on_add_mode_toggled)
         self.save_point_button.clicked.connect(self._on_save_point)
         self.name_input.returnPressed.connect(self._on_save_point)
@@ -293,6 +310,7 @@ class MainWindow(QMainWindow):
         self.engine.error.connect(self._on_engine_error)
 
         self.stream.point_selected.connect(self._on_screen_clicked)
+        self.stream.swipe_selected.connect(self._on_swipe_selected)
         self.stream.stream_started.connect(
             lambda serial: self._status(f"Stream uruchomiony: {serial}")
         )
@@ -368,20 +386,27 @@ class MainWindow(QMainWindow):
         self._status(f"Połączono bezprzewodowo: {text}")
 
     # ------------------------------------------------------------------
-    # Punkty mapowania
+    # Akcje mapowania
     # ------------------------------------------------------------------
 
     def _reload_points(self) -> None:
-        """Odświeża tabelę punktów i nakładkę na streamie."""
+        """Odświeża tabelę akcji i nakładkę na streamie."""
         points = self.config.load_config()
         self.table.setRowCount(0)
         for point in points:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            values = (point.name, point.key, str(point.x), str(point.y))
+            if isinstance(point, SwipePoint):
+                typ = "Swipe"
+                x_label = f"{point.x1} → {point.x2}"
+                y_label = f"{point.y1} → {point.y2}"
+            else:
+                typ = "Tap"
+                x_label, y_label = str(point.x), str(point.y)
+            values = (typ, point.name, point.key, x_label, y_label)
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col > 0:
+                if col != 1:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row, col, item)
         self.stream.set_overlay_points(points)
@@ -393,29 +418,51 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return
-        name = self.table.item(row, 0).text()
+        name = self.table.item(row, 1).text()
         self.config.remove_point(name)
         self._reload_points()
-        self._status(f"Usunięto punkt: {name}")
+        self._status(f"Usunięto akcję: {name}")
 
     # ------------------------------------------------------------------
-    # Dodawanie punktu (klik -> klawisz -> nazwa -> zapis)
+    # Dodawanie akcji (gest na ekranie -> klawisz -> nazwa -> zapis)
     # ------------------------------------------------------------------
+
+    def _gesture_kind(self) -> str:
+        """Rodzaj akcji wybranej w panelu dodawania: ``"tap"`` lub ``"swipe"``."""
+        return str(self.mode_combo.currentData() or "tap")
+
+    def _on_mode_changed(self) -> None:
+        self.stream.set_gesture_mode(self._gesture_kind())
+        self._reset_pending()
+        self._update_add_hint()
 
     def _on_add_mode_toggled(self, checked: bool) -> None:
         self.engine.set_add_mode(checked)
         self._reset_pending()
-        self.add_hint.setText(
-            "Kliknij lewym przyciskiem na ekranie telefonu, a potem wciśnij klawisz."
-            if checked
-            else "Nieaktywny."
-        )
+        if checked:
+            if self._gesture_kind() == "swipe":
+                hint = (
+                    "Przeciągnij myszą na ekranie telefonu (start → koniec), "
+                    "a potem wciśnij klawisz."
+                )
+            else:
+                hint = "Kliknij lewym przyciskiem na ekranie telefonu, a potem wciśnij klawisz."
+            self.add_hint.setText(hint)
+        else:
+            self.add_hint.setText("Nieaktywny.")
         self._update_engine()
 
     def _on_screen_clicked(self, x: int, y: int) -> None:
-        if not self.add_mode_check.isChecked():
+        if not self.add_mode_check.isChecked() or self._gesture_kind() != "tap":
             return
         self._pending["x"], self._pending["y"] = x, y
+        self._update_add_hint()
+
+    def _on_swipe_selected(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        if not self.add_mode_check.isChecked() or self._gesture_kind() != "swipe":
+            return
+        self._pending["x1"], self._pending["y1"] = x1, y1
+        self._pending["x2"], self._pending["y2"] = x2, y2
         self._update_add_hint()
 
     def _on_key_captured(self, key: str) -> None:
@@ -426,42 +473,80 @@ class MainWindow(QMainWindow):
 
     def _update_add_hint(self) -> None:
         p = self._pending
-        steps = []
-        if p["x"] is not None:
-            steps.append(f"X={p['x']}, Y={p['y']}")
+        if self._gesture_kind() == "swipe":
+            if p["x1"] is not None:
+                steps = [f"start ({p['x1']}, {p['y1']})", f"koniec ({p['x2']}, {p['y2']})"]
+            else:
+                steps = ["przeciągnij na ekranie (start → koniec)"]
+            gesture_ready = all(
+                p[k] is not None for k in ("x1", "y1", "x2", "y2")
+            )
         else:
-            steps.append("kliknij na ekranie")
+            if p["x"] is not None:
+                steps = [f"X={p['x']}, Y={p['y']}"]
+            else:
+                steps = ["kliknij na ekranie"]
+            gesture_ready = p["x"] is not None and p["y"] is not None
         if p["key"] is not None:
             steps.append(f"klawisz '{p['key']}'")
         else:
             steps.append("wciśnij klawisz")
         self.add_hint.setText(" -> ".join(steps) + ". Podaj nazwę i zapisz.")
-        self.save_point_button.setEnabled(
-            p["x"] is not None and p["y"] is not None and p["key"] is not None
-        )
+        self.save_point_button.setEnabled(gesture_ready and p["key"] is not None)
 
     def _on_save_point(self) -> None:
         p = self._pending
         name = self.name_input.text().strip()
-        if p["x"] is None or p["y"] is None or p["key"] is None:
-            self._status("Najpierw kliknij na ekranie i wciśnij klawisz.")
-            return
         if not name:
-            self._status("Podaj nazwę punktu.")
+            self._status("Podaj nazwę akcji.")
             return
-        key, x, y = p["key"], p["x"], p["y"]
+        if p["key"] is None:
+            self._status("Najpierw wciśnij klawisz.")
+            return
+        key = p["key"]
+
+        if self._gesture_kind() == "swipe":
+            if any(p[k] is None for k in ("x1", "y1", "x2", "y2")):
+                self._status("Najpierw przeciągnij na ekranie (start → koniec).")
+                return
+            try:
+                self.config.add_swipe(name, key, p["x1"], p["y1"], p["x2"], p["y2"])
+            except ValueError as exc:
+                self._status(f"Nie zapisano: {exc}")
+                return
+            self._reload_points()
+            self.name_input.clear()
+            self.add_mode_check.setChecked(False)  # wyłącza tryb i resetuje stan
+            self._status(
+                f"Zapisano swipe '{name}' -> klawisz {key} "
+                f"({p['x1']},{p['y1']}) → ({p['x2']},{p['y2']})"
+            )
+            return
+
+        # Tap
+        if p["x"] is None or p["y"] is None:
+            self._status("Najpierw kliknij na ekranie.")
+            return
         try:
-            self.config.add_point(name, key, x, y)
+            self.config.add_point(name, key, p["x"], p["y"])
         except ValueError as exc:
             self._status(f"Nie zapisano: {exc}")
             return
         self._reload_points()
         self.name_input.clear()
         self.add_mode_check.setChecked(False)  # wyłącza tryb i resetuje stan
-        self._status(f"Zapisano punkt '{name}' -> klawisz {key} ({x}, {y})")
+        self._status(f"Zapisano punkt '{name}' -> klawisz {key} ({p['x']}, {p['y']})")
 
     def _reset_pending(self) -> None:
-        self._pending = {"x": None, "y": None, "key": None}
+        self._pending = {
+            "key": None,
+            "x": None,
+            "y": None,
+            "x1": None,
+            "y1": None,
+            "x2": None,
+            "y2": None,
+        }
         self.save_point_button.setEnabled(False)
 
     # ------------------------------------------------------------------
@@ -484,7 +569,12 @@ class MainWindow(QMainWindow):
         point = self.config.get_point(key)
         if point is None or self.adb.device_serial is None:
             return
-        if not self.adb.tap(point.x, point.y):
+        if isinstance(point, SwipePoint):
+            if not self.adb.swipe(
+                point.x1, point.y1, point.x2, point.y2, point.duration_ms
+            ):
+                self._status(f"Swipe nieudany dla klawisza '{key}'")
+        elif not self.adb.tap(point.x, point.y):
             self._status(f"Tap nieudany dla klawisza '{key}'")
 
     def _on_engine_error(self, message: str) -> None:

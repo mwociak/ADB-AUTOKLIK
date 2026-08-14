@@ -154,6 +154,39 @@ class ADBController:
             )
             return False
 
+    def swipe(
+        self,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        duration_ms: int = 300,
+    ) -> bool:
+        """Wysyła gest przesunięcia (swipe/drag) od (x1, y1) do (x2, y2).
+
+        ``duration_ms`` to czas przeciągnięcia palcem: krótkie wartości
+        (np. 100-300) dają szybki "flick", dłuższe (600-800) wolniejszy,
+        bardziej naturalny drag. Zwraca ``True`` przy powodzeniu,
+        ``False`` przy niepowodzeniu (odłączone urządzenie, timeout) -
+        analogicznie do :meth:`tap`.
+        """
+        device = self._require_device()
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        duration_ms = max(0, int(duration_ms))
+        try:
+            device.shell(
+                ["input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)],
+                timeout=SHELL_TIMEOUT,
+            )
+            return True
+        except (adbutils.AdbError, OSError) as exc:
+            print(
+                f"[ADBController] Nie udało się wysłać swipe "
+                f"({x1}, {y1}) -> ({x2}, {y2}) na {device.serial}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
     def get_screen_size(self) -> tuple[int, int] | None:
         """Zwraca rozdzielczość ekranu telefonu jako krotkę (width, height).
 

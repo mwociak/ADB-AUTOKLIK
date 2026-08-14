@@ -1,10 +1,16 @@
 """AndroidScreenWidget - podgląd ekranu telefonu na żywo (scrcpy).
 
 Widżet PyQt6 wyświetla strumień wideo z telefonu przez ``scrcpy-client``
-wraz z nakładką zdefiniowanych punktów keymapy. Kliknięcie lewym
-przyciskiem myszy na obraz telefonu emituje sygnał
+wraz z nakładką zdefiniowanych akcji keymapy (tapy i swipe'y). Kliknięcie
+lewym przyciskiem myszy na obraz telefonu emituje sygnał
 :attr:`point_selected` z rzeczywistymi współrzędnymi ekranu (x_phone,
 y_phone) - z uwzględnieniem skalowania i czarnych pasów (letterboxing).
+
+W trybie ``swipe`` (patrz :meth:`set_gesture_mode`) użytkownik definiuje
+gest myszą: wciska LPM w punkcie startowym, przeciąga i puszcza w punkcie
+końcowym - widżet emituje wtedy :attr:`swipe_selected` (x1, y1, x2, y2).
+Podczas przeciągania rysowany jest podgląd strzałki; zapisane swipe'y
+rysowane są na nakładce jako strzałki z klawiszem przy punkcie startowym.
 
 Wymagane zależności: PyQt6, scrcpy-client (z git main -
 ``leng-yue/py-scrcpy-client``), numpy.
@@ -12,6 +18,7 @@ Wymagane zależności: PyQt6, scrcpy-client (z git main -
 
 from __future__ import annotations
 
+import math
 import threading
 
 import numpy as np
@@ -23,7 +30,7 @@ from PyQt6.QtWidgets import QWidget
 # serial - używamy wariantu z serialem (spójnie z ADBController).
 from scrcpy import Client
 
-from config_manager import KeyPoint
+from config_manager import KeyPoint, SwipePoint
 
 # Domyślne parametry streamu: pełna rozdzielczość telefonu (max_width=0),
 # ograniczone fps (oszczędność CPU/bandwidth), klatki tylko gdy nowe.
@@ -36,14 +43,23 @@ _OVERLAY_FILL = QColor(24, 140, 255, 110)
 _OVERLAY_BORDER = QColor(255, 255, 255, 220)
 _OVERLAY_TEXT = QColor(255, 255, 255)
 _OVERLAY_RADIUS = 13.0
+# Strzałka gestu swipe (nakładka) i podgląd przeciągania myszą.
+_SWIPE_ARROW = QColor(255, 170, 40, 230)
+_DRAG_PREVIEW = QColor(255, 255, 255, 170)
+_SWIPE_END_RADIUS = 5.0
+# Minimalne przesunięcie myszy [px], aby uznać gest za swipe (a nie klik).
+_SWIPE_MIN_DRAG_PX = 10
 
 
 class AndroidScreenWidget(QWidget):
-    """Wyświetla strumień wideo z telefonu i przelicza kliknięcia na współrzędne.
+    """Wyświetla strumień wideo z telefonu i przelicza gesty myszy na współrzędne.
 
     Sygnały:
         point_selected(int, int): kliknięcie na obrazie telefonu,
             emitowane z rzeczywistymi współrzędnymi (x_phone, y_phone).
+        swipe_selected(int, int, int, int): przeciągnięcie myszą na
+            obrazie telefonu; argumenty to (x1, y1, x2, y2) - rzeczywiste
+            współrzędne startu i końca gestu.
         stream_started(str): stream dla danego serialu został uruchomiony.
         stream_stopped(str): stream zatrzymany; argument to powód
             ("" przy normalnym zatrzymaniu, inaczej opis błędu/odłączenia).
@@ -55,6 +71,7 @@ class AndroidScreenWidget(QWidget):
     """
 
     point_selected = pyqtSignal(int, int)
+    swipe_selected = pyqtSignal(int, int, int, int)
     stream_started = pyqtSignal(str)
     stream_stopped = pyqtSignal(str)
     stream_error = pyqtSignal(str)
@@ -84,8 +101,13 @@ class AndroidScreenWidget(QWidget):
         self._draw_rect = QRectF()  # prostokąt rysowania (letterbox) w koordynatach widżetu
         self._frame_pending = False
 
-        # Nakładka (punkty keymapy)
-        self._overlay_points: list[KeyPoint] = []
+        # Nakładka (akcje keymapy: tapy i swipe'y)
+        self._overlay_points: list[KeyPoint | SwipePoint] = []
+
+        # Gesty myszy: "tap" (klik) lub "swipe" (przeciągnij i puść)
+        self._gesture_mode = "tap"
+        self._drag_start: QPointF | None = None  # pozycja wciśnięcia LPM (widżet)
+        self._drag_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
 
         self._frame_received.connect(self._on_frame_gui)
         self.setMouseTracking(True)
@@ -224,21 +246,42 @@ class AndroidScreenWidget(QWidget):
             self._draw_rect = rect
             for point in self._overlay_points:
                 self._draw_overlay_point(painter, point)
+            # Podgląd przeciągania myszą (tryb swipe)
+            if self._drag_start is not None and self._drag_current is not None:
+                self._draw_overlay_arrow(
+                    painter,
+                    (self._drag_start.x(), self._drag_start.y()),
+                    (self._drag_current.x(), self._drag_current.y()),
+                    _DRAG_PREVIEW,
+                    width=2.0,
+                )
         else:
             painter.setPen(QColor(140, 155, 170))
             painter.drawText(
                 self.rect(), Qt.AlignmentFlag.AlignCenter, _PLACEHOLDER
             )
 
-    def _draw_overlay_point(self, painter: QPainter, point: KeyPoint) -> None:
-        """Rysuje półprzezroczyste kółko z klawiszem na pozycji punktu."""
+    def _draw_overlay_point(
+        self, painter: QPainter, point: KeyPoint | SwipePoint
+    ) -> None:
+        """Rysuje akcję keymapy: tap = kółko, swipe = strzałka + kółko startowe."""
         if self._phone_size is None:
             return
-        pw, ph = self._phone_size
-        r = self._draw_rect
-        cx = r.left() + point.x / pw * r.width()
-        cy = r.top() + point.y / ph * r.height()
+        if isinstance(point, SwipePoint):
+            sx, sy = self._to_widget(point.x1, point.y1)
+            ex, ey = self._to_widget(point.x2, point.y2)
+            self._draw_overlay_arrow(painter, (sx, sy), (ex, ey), _SWIPE_ARROW)
+            self._draw_overlay_circle(painter, sx, sy, point.key)
+            # Małe kółko na końcu gestu (bez klawisza)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(_OVERLAY_BORDER)
+            painter.drawEllipse(QPointF(ex, ey), _SWIPE_END_RADIUS, _SWIPE_END_RADIUS)
+            return
+        cx, cy = self._to_widget(point.x, point.y)
+        self._draw_overlay_circle(painter, cx, cy, point.key)
 
+    def _draw_overlay_circle(self, painter: QPainter, cx: float, cy: float, key: str) -> None:
+        """Rysuje półprzezroczyste kółko z literą klawisza w środku."""
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(_OVERLAY_FILL)
         painter.drawEllipse(QPointF(cx, cy), _OVERLAY_RADIUS, _OVERLAY_RADIUS)
@@ -251,7 +294,7 @@ class AndroidScreenWidget(QWidget):
         font.setPointSizeF(11.0)
         painter.setFont(font)
         painter.setPen(_OVERLAY_TEXT)
-        label = point.key.upper() if point.key else "?"
+        label = key.upper() if key else "?"
         painter.drawText(
             QRectF(cx - _OVERLAY_RADIUS, cy - _OVERLAY_RADIUS,
                    2 * _OVERLAY_RADIUS, 2 * _OVERLAY_RADIUS),
@@ -259,16 +302,89 @@ class AndroidScreenWidget(QWidget):
             label,
         )
 
+    def _draw_overlay_arrow(
+        self,
+        painter: QPainter,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        color: QColor,
+        width: float = 3.0,
+        head_len: float = 12.0,
+    ) -> None:
+        """Rysuje strzałkę od ``start`` do ``end`` (współrzędne widżetu)."""
+        x1, y1 = start
+        x2, y2 = end
+        pen = QPen(color, width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        if math.hypot(x2 - x1, y2 - y1) < 1.0:
+            return
+        angle = math.atan2(y2 - y1, x2 - x1)
+        for offset in (math.pi * 5 / 6, -math.pi * 5 / 6):
+            tip = QPointF(
+                x2 + head_len * math.cos(angle + offset),
+                y2 + head_len * math.sin(angle + offset),
+            )
+            painter.drawLine(QPointF(x2, y2), tip)
+
     # ------------------------------------------------------------------
-    # Kliknięcia myszy -> współrzędne telefonu
+    # Gesty myszy -> współrzędne telefonu
     # ------------------------------------------------------------------
+
+    def set_gesture_mode(self, mode: str) -> None:
+        """Ustawia interpretację myszy: ``"tap"`` lub ``"swipe"``.
+
+        W trybie ``"tap"`` kliknięcie emituje :attr:`point_selected`.
+        W trybie ``"swipe"`` przeciągnięcie (wciśnij -> przeciągnij ->
+        puść) emituje :attr:`swipe_selected` (x1, y1, x2, y2); kliknięcie
+        bez przeciągnięcia nadal emituje :attr:`point_selected`.
+        """
+        if mode not in ("tap", "swipe"):
+            raise ValueError(f"Nieznany tryb gestu: {mode!r}")
+        self._gesture_mode = mode
+        self._drag_start = None
+        self._drag_current = None
+        self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
         if event.button() == Qt.MouseButton.LeftButton:
-            phone = self._to_phone(event.position())
-            if phone is not None:
-                self.point_selected.emit(*phone)
+            if self._gesture_mode == "swipe":
+                self._drag_start = event.position()
+                self._drag_current = event.position()
+                self.update()
+            else:
+                phone = self._to_phone(event.position())
+                if phone is not None:
+                    self.point_selected.emit(*phone)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if self._gesture_mode == "swipe" and self._drag_start is not None:
+            self._drag_current = event.position()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if (
+            self._gesture_mode == "swipe"
+            and self._drag_start is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            start = self._drag_start
+            end = event.position()
+            self._drag_start = None
+            self._drag_current = None
+            self.update()
+            p1 = self._to_phone(start)
+            p2 = self._to_phone(end)
+            if p1 is None or p2 is None:
+                return
+            if math.hypot(end.x() - start.x(), end.y() - start.y()) >= _SWIPE_MIN_DRAG_PX:
+                self.swipe_selected.emit(*p1, *p2)
+            else:
+                self.point_selected.emit(*p1)  # klik bez przeciągnięcia = tap
+        super().mouseReleaseEvent(event)
 
     def _to_phone(self, pos: QPointF) -> tuple[int, int] | None:
         """Przelicza pozycję w widżecie na współrzędne telefonu.
@@ -288,12 +404,23 @@ class AndroidScreenWidget(QWidget):
         y = min(max(int(fy * ph), 0), ph - 1)
         return (x, y)
 
+    def _to_widget(self, x: int, y: int) -> tuple[float, float]:
+        """Przelicza współrzędne telefonu na pozycję w widżecie (rysowanie)."""
+        if self._phone_size is None or self._draw_rect.isNull():
+            return (0.0, 0.0)
+        pw, ph = self._phone_size
+        r = self._draw_rect
+        return (
+            r.left() + x / pw * r.width(),
+            r.top() + y / ph * r.height(),
+        )
+
     # ------------------------------------------------------------------
-    # Nakładka punktów keymapy
+    # Nakładka akcji keymapy
     # ------------------------------------------------------------------
 
-    def set_overlay_points(self, points: list[KeyPoint]) -> None:
-        """Ustawia punkty keymapy do narysowania na obrazie telefonu."""
+    def set_overlay_points(self, points: list[KeyPoint | SwipePoint]) -> None:
+        """Ustawia akcje keymapy (tapy i swipe'y) do narysowania na ekranie."""
         self._overlay_points = list(points)
         self.update()
 
