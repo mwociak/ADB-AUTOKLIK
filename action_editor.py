@@ -3,7 +3,9 @@
 Widżet zawiera:
 - tabelę zapisanych akcji (Typ, Nazwa, Klawisz, X, Y) z przyciskiem usuwania,
 - formularz dodawania: wybór typu akcji (Tap/Swipe/Makro), tryb rysowania
-  gestu na ekranie (klik / przeciągnięcie) + przechwycenie klawisza, nazwa,
+  gestu na ekranie (klik / przeciągnięcie), osobne pola ``key_input``
+  (klawisz - ustawiany automatycznie przez pynput LUB ręcznie) i
+  ``name_input`` (nazwa akcji),
 - dla makr: edytor kroków (nagrywanie z ekranu, dodawanie Delay, usuwanie
   kroków, zapis makra) oraz podświetlanie aktualnie wykonywanego kroku
   podczas odtwarzania (patrz :meth:`begin_macro_preview`).
@@ -86,8 +88,8 @@ class ActionEditor(QWidget):
     def __init__(self, config: ConfigManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.config = config
-        self._pending: dict[str, int | str | None] = {
-            "key": None,
+        # Współrzędne gestu wybranego na ekranie (klawisz żyje w ``key_input``).
+        self._pending: dict[str, int | None] = {
             "x": None,
             "y": None,
             "x1": None,
@@ -173,6 +175,15 @@ class ActionEditor(QWidget):
         add_layout.addWidget(self.macro_delay_row)
         add_layout.addWidget(self.macro_remove_step_button)
 
+        # Klawisz: ustawiany automatycznie po przechwyceniu przez pynput,
+        # ale użytkownik może go też wpisać/zmienić ręcznie.
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("Klawisz:"))
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("np. a, space, shift")
+        key_row.addWidget(self.key_input, 1)
+        add_layout.addLayout(key_row)
+
         name_row = QHBoxLayout()
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Nazwa akcji")
@@ -191,6 +202,8 @@ class ActionEditor(QWidget):
         self.macro_record_check.toggled.connect(self._on_macro_record_toggled)
         self.save_point_button.clicked.connect(self._on_save_point)
         self.name_input.returnPressed.connect(self._on_save_point)
+        self.key_input.textChanged.connect(self._update_save_button_state)
+        self.name_input.textChanged.connect(self._update_save_button_state)
         self.delay_button.clicked.connect(self._on_add_delay)
         self.macro_remove_step_button.clicked.connect(self._on_remove_macro_step)
 
@@ -325,7 +338,12 @@ class ActionEditor(QWidget):
                 return
         elif not self.add_mode_check.isChecked():
             return
-        self._pending["key"] = key
+        # Pisanie w polach tekstowych nie nadpisuje pola klawisza znakami,
+        # które użytkownik wpisuje do nazwy (lub ręcznie do pola klawisza).
+        if self.key_input.hasFocus() or self.name_input.hasFocus():
+            return
+        self.key_input.setText(key)
+        self.name_input.setFocus()  # od razu przejdź do wpisania nazwy
         self._update_add_hint()
 
     def disable_capture(self) -> None:
@@ -400,25 +418,45 @@ class ActionEditor(QWidget):
                 steps = [f"nagrano {_plural_steps(len(self._macro_steps))}"]
             else:
                 steps = ["dodaj kroki (klik/przeciągnij na ekranie lub Delay)"]
-            gesture_ready = len(self._macro_steps) > 0
         elif self._gesture_kind() == "swipe":
             if p["x1"] is not None:
                 steps = [f"start ({p['x1']}, {p['y1']})", f"koniec ({p['x2']}, {p['y2']})"]
             else:
                 steps = ["przeciągnij na ekranie (start → koniec)"]
-            gesture_ready = all(p[k] is not None for k in ("x1", "y1", "x2", "y2"))
         else:
             if p["x"] is not None:
                 steps = [f"X={p['x']}, Y={p['y']}"]
             else:
                 steps = ["kliknij na ekranie"]
-            gesture_ready = p["x"] is not None and p["y"] is not None
-        if p["key"] is not None:
-            steps.append(f"klawisz '{p['key']}'")
+        key = self.key_input.text().strip()
+        if key:
+            steps.append(f"klawisz '{key}'")
         else:
-            steps.append("wciśnij klawisz")
+            steps.append("wciśnij klawisz lub wpisz go")
         self.add_hint.setText(" -> ".join(steps) + ". Podaj nazwę i zapisz.")
-        self.save_point_button.setEnabled(gesture_ready and p["key"] is not None)
+        self._update_save_button_state()
+
+    def _gesture_ready(self) -> bool:
+        """Czy wybrano gest/koordynaty na ekranie (zależnie od typu akcji)."""
+        p = self._pending
+        if self._gesture_kind() == "macro":
+            return len(self._macro_steps) > 0
+        if self._gesture_kind() == "swipe":
+            return all(p[k] is not None for k in ("x1", "y1", "x2", "y2"))
+        return p["x"] is not None and p["y"] is not None
+
+    def _update_save_button_state(self) -> None:
+        """Przycisk zapisu aktywny, gdy: gest wybrany + klawisz + nazwa.
+
+        Podpięty do ``textChanged`` obu pól, więc odblokowuje się
+        dynamicznie podczas pisania (również ręcznie wpisanego klawisza).
+        """
+        ready = (
+            self._gesture_ready()
+            and bool(self.key_input.text().strip())
+            and bool(self.name_input.text().strip())
+        )
+        self.save_point_button.setEnabled(ready)
 
     def _on_save_point(self) -> None:
         p = self._pending
@@ -426,10 +464,10 @@ class ActionEditor(QWidget):
         if not name:
             self.status_message.emit("Podaj nazwę akcji.")
             return
-        if p["key"] is None:
-            self.status_message.emit("Najpierw wciśnij klawisz.")
+        key = self.key_input.text().strip().lower()
+        if not key:
+            self.status_message.emit("Podaj klawisz (np. 'a', 'space').")
             return
-        key = p["key"]
 
         if self._gesture_kind() == "macro":
             if not self._macro_steps:
@@ -443,6 +481,7 @@ class ActionEditor(QWidget):
             count = len(self._macro_steps)
             self.reload_table()
             self.name_input.clear()
+            self.key_input.clear()
             self.macro_record_check.setChecked(False)  # wyłącza nagrywanie
             self._macro_steps = []
             self._refresh_macro_steps()
@@ -463,6 +502,7 @@ class ActionEditor(QWidget):
                 return
             self.reload_table()
             self.name_input.clear()
+            self.key_input.clear()
             self.add_mode_check.setChecked(False)  # wyłącza tryb i resetuje stan
             self.points_changed.emit()
             self.status_message.emit(
@@ -482,13 +522,13 @@ class ActionEditor(QWidget):
             return
         self.reload_table()
         self.name_input.clear()
+        self.key_input.clear()
         self.add_mode_check.setChecked(False)  # wyłącza tryb i resetuje stan
         self.points_changed.emit()
         self.status_message.emit(f"Zapisano punkt '{name}' -> klawisz {key} ({p['x']}, {p['y']})")
 
     def _reset_pending(self) -> None:
         self._pending = {
-            "key": None,
             "x": None,
             "y": None,
             "x1": None,
@@ -496,4 +536,5 @@ class ActionEditor(QWidget):
             "x2": None,
             "y2": None,
         }
-        self.save_point_button.setEnabled(False)
+        self.key_input.clear()
+        self._update_save_button_state()

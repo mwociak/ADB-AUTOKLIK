@@ -123,6 +123,9 @@ class AndroidScreenWidget(QWidget):
 
         self._frame_received.connect(self._on_frame_gui)
         self.setMouseTracking(True)
+        # Kliknięcie na ekranie przejmuje fokus z pól tekstowych edytora,
+        # żeby klawisz definiowany dla akcji trafiał do pynput (a nie do pola).
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
 
     # ------------------------------------------------------------------
     # Sterowanie streamem
