@@ -26,7 +26,7 @@ Aplikacja łączy się z urządzeniem przez **ADB**, wyświetla podgląd ekranu 
 
 ## 🖼️ Zrzut ekranu
 
-*(Wkrótce – możesz dodać obrazek np. `screenshot.png`)*
+*(Wkrótce)*
 
 ---
 
