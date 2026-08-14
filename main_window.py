@@ -130,6 +130,8 @@ class MainWindow(QMainWindow):
         ae.capture_mode_changed.connect(self._on_capture_mode_changed)
         ae.points_changed.connect(self._on_points_changed)
         ae.status_message.connect(self._status)
+        ae.macro_edit_changed.connect(self._on_macro_edit_changed)
+        ae.screen_gesture_capture.connect(self.stream.set_capture_enabled)
 
         # Keymapper
         km.toggled.connect(self._on_keymapper_toggled)
@@ -141,6 +143,7 @@ class MainWindow(QMainWindow):
         st.point_selected.connect(ae.on_screen_clicked)
         st.swipe_selected.connect(ae.on_swipe_selected)
         st.point_moved.connect(self._on_point_moved)
+        st.macro_step_moved.connect(self._on_macro_step_moved)
         st.stream_started.connect(
             lambda serial: self._status(f"Stream uruchomiony: {serial}")
         )
@@ -205,6 +208,37 @@ class MainWindow(QMainWindow):
         self.action_editor.reload_table()
         self.stream.set_overlay_points(self.config.load_config())
         self._status(f"Przesunięto '{name}' → ({new_x}, {new_y})")
+
+    def _on_macro_edit_changed(self, macro_name: str | None, step_index: int | None) -> None:
+        """Ustawia wyróżnienie edytowanego kroku makra na nakładce."""
+        self.stream.set_macro_step_edit(macro_name, step_index)
+
+    def _on_macro_step_moved(
+        self, macro_name: str, step_index: int, new_x: int, new_y: int
+    ) -> None:
+        """Drag & drop pojedynczego kroku: aktualizuje TYLKO ten krok i zapisuje."""
+        macro = self.config.get_point(macro_name)
+        if not isinstance(macro, MacroPoint):
+            self._status(f"Nie znaleziono makra: {macro_name}")
+            return
+        if step_index < 0 or step_index >= len(macro.actions):
+            return
+        action = macro.actions[step_index]
+        kind = action.get("type")
+        if kind == "tap":
+            action["x"], action["y"] = new_x, new_y
+        elif kind == "swipe":
+            dx = new_x - int(action["x1"])
+            dy = new_y - int(action["y1"])
+            action["x1"], action["y1"] = new_x, new_y
+            action["x2"] = max(0, int(action["x2"]) + dx)
+            action["y2"] = max(0, int(action["y2"]) + dy)
+        else:
+            return  # Delay nie ma pozycji
+        self.config.save_config()
+        self.stream.set_overlay_points(self.config.load_config())
+        self.action_editor.reload_macro_steps()
+        self._status(f"Zaktualizowano krok {step_index + 1} makra '{macro_name}'")
 
     # ------------------------------------------------------------------
     # Keymapper / wykonanie akcji

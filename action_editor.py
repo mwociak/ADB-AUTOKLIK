@@ -8,13 +8,18 @@ Widżet zawiera:
   ``name_input`` (nazwa akcji),
 - dla makr: edytor kroków (nagrywanie z ekranu, dodawanie Delay, usuwanie
   kroków, zapis makra) oraz podświetlanie aktualnie wykonywanego kroku
-  podczas odtwarzania (patrz :meth:`begin_macro_preview`).
+  podczas odtwarzania (patrz :meth:`begin_macro_preview`),
+- edycję kroków istniejącego makra: wybór wiersza Macro w tabeli wczytuje
+  kroki do listy, kliknięcie kroku aktywuje tryb "Edycja kroku" (zapis
+  zmiany / zastąpienie pozycji gestem z ekranu / drag & drop na nakładce).
 
 Komunikacja z resztą aplikacji odbywa się sygnałami Qt:
     mode_changed(str)           - zmieniono typ akcji ("tap"|"swipe"|"macro"),
     capture_mode_changed(bool)  - włączono/wyłączono przechwytywanie gestów,
     points_changed()            - zmieniono zestaw akcji (dodano/usunięto),
-    status_message(str)         - komunikat do paska statusu.
+    status_message(str)         - komunikat do paska statusu,
+    macro_edit_changed(str|None, int|None) - edytowany krok makra (dla nakładki),
+    screen_gesture_capture(bool) - przechwytywanie TYLKO streamu (bez pynput).
 """
 
 from __future__ import annotations
@@ -51,6 +56,8 @@ from config_manager import (
 _ACTIVE_STEP_BG = QColor(30, 120, 210, 110)
 _ACTIVE_STEP_FG = QColor(255, 255, 255)
 _INACTIVE_STEP_FG = QColor(215, 222, 230)
+# Podświetlenie kroku edytowanego (tryb "Edycja kroku").
+_EDIT_STEP_BG = QColor(230, 120, 20, 90)
 
 
 def _plural_steps(n: int) -> str:
@@ -84,6 +91,8 @@ class ActionEditor(QWidget):
     capture_mode_changed = pyqtSignal(bool)
     points_changed = pyqtSignal()
     status_message = pyqtSignal(str)
+    macro_edit_changed = pyqtSignal(object, object)  # (nazwa makra, indeks kroku)
+    screen_gesture_capture = pyqtSignal(bool)  # przechwytywanie TYLKO streamu
 
     def __init__(self, config: ConfigManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -99,6 +108,10 @@ class ActionEditor(QWidget):
         }
         self._macro_steps: list[dict] = []
         self._preview_actions: list[dict] | None = None  # podgląd odtwarzanego makra
+        # Tryb edycji kroków istniejącego makra (wybranego w tabeli)
+        self._editing_macro_name: str | None = None
+        self._editing_step: int | None = None
+        self._replace_step_mode = False  # następny gest na ekranie zastępuje krok
 
         self._build_ui()
         self._wire()
@@ -175,6 +188,20 @@ class ActionEditor(QWidget):
         add_layout.addWidget(self.macro_delay_row)
         add_layout.addWidget(self.macro_remove_step_button)
 
+        # Tryb edycji kroków istniejącego makra (widoczny po zaznaczeniu kroku)
+        self.macro_edit_label = QLabel("")
+        self.macro_edit_label.setWordWrap(True)
+        self.macro_edit_label.setStyleSheet("color: #ffb84d; font-size: 12px;")
+        self.step_edit_row = QWidget()
+        step_row_layout = QHBoxLayout(self.step_edit_row)
+        step_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.step_save_button = QPushButton("Zapisz zmianę w kroku")
+        self.step_replace_button = QPushButton("Zastąp pozycję (kliknij na ekranie)")
+        step_row_layout.addWidget(self.step_save_button)
+        step_row_layout.addWidget(self.step_replace_button)
+        add_layout.addWidget(self.macro_edit_label)
+        add_layout.addWidget(self.step_edit_row)
+
         # Klawisz: ustawiany automatycznie po przechwyceniu przez pynput,
         # ale użytkownik może go też wpisać/zmienić ręcznie.
         key_row = QHBoxLayout()
@@ -206,6 +233,9 @@ class ActionEditor(QWidget):
         self.name_input.textChanged.connect(self._update_save_button_state)
         self.delay_button.clicked.connect(self._on_add_delay)
         self.macro_remove_step_button.clicked.connect(self._on_remove_macro_step)
+        self.macro_steps_list.itemClicked.connect(self._on_macro_step_clicked)
+        self.step_save_button.clicked.connect(self._on_step_save)
+        self.step_replace_button.clicked.connect(self._on_step_replace)
 
     # ------------------------------------------------------------------
     # Tabela akcji
@@ -238,6 +268,16 @@ class ActionEditor(QWidget):
 
     def _on_table_selection(self) -> None:
         self.delete_button.setEnabled(self.table.currentRow() >= 0)
+        row = self.table.currentRow()
+        if row < 0:
+            self._stop_editing_macro()
+            return
+        name = self.table.item(row, 1).text()
+        point = self.config.get_point(name)
+        if isinstance(point, MacroPoint):
+            self._start_editing_macro(point.name)
+        else:
+            self._stop_editing_macro()
 
     def _on_delete_point(self) -> None:
         row = self.table.currentRow()
@@ -263,6 +303,8 @@ class ActionEditor(QWidget):
 
     def _on_mode_changed(self) -> None:
         kind = self._gesture_kind()
+        if kind != "macro":
+            self._stop_editing_macro()
         self._set_macro_editor_visible(kind == "macro")
         self.save_point_button.setText("Zapisz Makro" if kind == "macro" else "Zapisz akcję")
         self._reset_pending()
@@ -311,6 +353,8 @@ class ActionEditor(QWidget):
                 self._macro_steps.append(tap_action(x, y))
                 self._refresh_macro_steps()
                 self._update_add_hint()
+                return
+            self._handle_step_replace("tap", x, y)
             return
         if not self.add_mode_check.isChecked() or kind != "tap":
             return
@@ -324,6 +368,8 @@ class ActionEditor(QWidget):
                 self._macro_steps.append(swipe_action(x1, y1, x2, y2))
                 self._refresh_macro_steps()
                 self._update_add_hint()
+                return
+            self._handle_step_replace("swipe", x1, y1, x2, y2)
             return
         if not self.add_mode_check.isChecked() or kind != "swipe":
             return
@@ -352,7 +398,7 @@ class ActionEditor(QWidget):
         self.macro_record_check.setChecked(False)
 
     # ------------------------------------------------------------------
-    # Kroki makra
+    # Kroki makra (kompozycja)
     # ------------------------------------------------------------------
 
     def _on_add_delay(self) -> None:
@@ -368,18 +414,27 @@ class ActionEditor(QWidget):
         self._refresh_macro_steps()
         self._update_add_hint()
 
+    def _steps_source(self) -> list[dict]:
+        """Kroki do wyświetlenia: edytowane makro > podgląd odtwarzania > kompozycja."""
+        if self._editing_macro_name:
+            macro = self._editing_macro()
+            return macro.actions if macro else []
+        if self._preview_actions is not None:
+            return self._preview_actions
+        return self._macro_steps
+
     def _refresh_macro_steps(self) -> None:
-        """Odświeża listę kroków (kompozycja LUB podgląd odtwarzanego makra)."""
+        """Odświeża listę kroków (kompozycja / podgląd odtwarzania / edycja makra)."""
         self.macro_steps_list.clear()
-        steps = (
-            self._preview_actions
-            if self._preview_actions is not None
-            else self._macro_steps
-        )
-        for i, action in enumerate(steps, start=1):
+        for i, action in enumerate(self._steps_source(), start=1):
             item = QListWidgetItem(f"{i}. {_format_action(action)}")
             item.setForeground(_INACTIVE_STEP_FG)
             self.macro_steps_list.addItem(item)
+        self._update_edit_ui()
+
+    def reload_macro_steps(self) -> None:
+        """Publiczne odświeżenie listy kroków (np. po drag & drop kroku na nakładce)."""
+        self._refresh_macro_steps()
 
     # ------------------------------------------------------------------
     # Podgląd odtwarzanego makra (sygnały z MacroRunner)
@@ -406,6 +461,161 @@ class ActionEditor(QWidget):
         self._preview_actions = None
         self._refresh_macro_steps()
         self.set_current_macro_step(None)
+
+    # ------------------------------------------------------------------
+    # Edycja kroków istniejącego makra
+    # ------------------------------------------------------------------
+
+    def _editing_macro(self) -> MacroPoint | None:
+        """Aktualny (żywy) obiekt edytowanego makra z konfiguracji."""
+        if not self._editing_macro_name:
+            return None
+        point = self.config.get_point(self._editing_macro_name)
+        return point if isinstance(point, MacroPoint) else None
+
+    def _start_editing_macro(self, name: str) -> None:
+        """Wczytuje kroki makra do listy i wchodzi w tryb edycji kroków."""
+        point = self.config.get_point(name)
+        if not isinstance(point, MacroPoint):
+            return
+        self._editing_macro_name = name
+        self._editing_step = None
+        self._replace_step_mode = False
+        # Pokaż edytor kroków (przełącz tryb na "macro")
+        if self._gesture_kind() != "macro":
+            index = self.mode_combo.findData("macro")
+            if index >= 0:
+                self.mode_combo.setCurrentIndex(index)
+        # Wyłącz nagrywanie/przechwytywanie nowych gestów w trybie edycji
+        self.add_mode_check.setChecked(False)
+        self.macro_record_check.setChecked(False)
+        self._refresh_macro_steps()
+        self._emit_macro_edit()
+
+    def _stop_editing_macro(self) -> None:
+        if self._editing_macro_name is None and self._editing_step is None:
+            return
+        was_armed = self._replace_step_mode
+        self._editing_macro_name = None
+        self._editing_step = None
+        self._replace_step_mode = False
+        if was_armed:
+            self.screen_gesture_capture.emit(False)
+        self._refresh_macro_steps()
+        self._emit_macro_edit()
+
+    def _on_macro_step_clicked(self, item: QListWidgetItem) -> None:
+        """Kliknięcie kroku w liście aktywuje tryb "Edycja kroku"."""
+        if self._editing_macro_name is None:
+            return
+        self._editing_step = self.macro_steps_list.row(item)
+        self._replace_step_mode = False
+        self.screen_gesture_capture.emit(False)
+        self._update_edit_ui()
+        self._emit_macro_edit()
+
+    def _update_edit_ui(self) -> None:
+        """Aktualizuje widok trybu edycji: przyciski, etykieta, podświetlenie kroku."""
+        editing = self._editing_macro_name is not None
+        self.macro_edit_label.setVisible(editing)
+        self.step_edit_row.setVisible(editing)
+        self.macro_record_check.setEnabled(not editing)
+        macro = self._editing_macro() if editing else None
+        if editing and macro is not None:
+            total = len(macro.actions)
+            if self._editing_step is None:
+                self.macro_edit_label.setText(
+                    f"Edycja makra: {self._editing_macro_name} — kliknij krok na liście."
+                )
+            else:
+                self.macro_edit_label.setText(
+                    f"Edycja: {self._editing_macro_name}, "
+                    f"krok {self._editing_step + 1}/{total}."
+                )
+            self.step_replace_button.setText(
+                "Zastąp pozycję (kliknij na ekranie)… aktywne"
+                if self._replace_step_mode
+                else "Zastąp pozycję (kliknij na ekranie)"
+            )
+        for i in range(self.macro_steps_list.count()):
+            item = self.macro_steps_list.item(i)
+            active = editing and i == self._editing_step
+            item.setBackground(_EDIT_STEP_BG if active else QColor(0, 0, 0, 0))
+
+    def _emit_macro_edit(self) -> None:
+        self.macro_edit_changed.emit(self._editing_macro_name, self._editing_step)
+
+    def update_step(self, index: int, new_action: dict) -> None:
+        """Podmienia krok ``index`` w edytowanym makrze i zapisuje konfigurację."""
+        macro = self._editing_macro()
+        if macro is None:
+            raise ValueError("Brak edytowanego makra")
+        if index < 0 or index >= len(macro.actions):
+            raise IndexError(f"Niepoprawny indeks kroku: {index}")
+        macro.actions[index] = dict(new_action)
+        self.config.save_config()
+        self._refresh_macro_steps()
+        self.status_message.emit(
+            f"Zaktualizowano krok {index + 1} makra '{macro.name}'."
+        )
+
+    def _on_step_save(self) -> None:
+        """Zatwierdza zmiany edytowanego kroku (zapis + koniec edycji kroku)."""
+        macro = self._editing_macro()
+        if macro is None:
+            return
+        self.config.save_config()
+        self._editing_step = None
+        self._replace_step_mode = False
+        self.screen_gesture_capture.emit(False)
+        self._refresh_macro_steps()
+        self._emit_macro_edit()
+        self.status_message.emit(f"Zapisano zmiany w makrze '{macro.name}'.")
+
+    def _on_step_replace(self) -> None:
+        """Uzbraja tryb: następny gest na ekranie zastąpi pozycję wybranego kroku."""
+        macro = self._editing_macro()
+        if macro is None:
+            return
+        if self._editing_step is None or self._editing_step >= len(macro.actions):
+            self.status_message.emit("Najpierw zaznacz krok na liście.")
+            return
+        action = macro.actions[self._editing_step]
+        if action.get("type") == "delay":
+            self.status_message.emit("Krok Delay nie ma pozycji do zastąpienia.")
+            return
+        self._replace_step_mode = True
+        self.screen_gesture_capture.emit(True)  # tylko stream, bez pynput
+        self._update_edit_ui()
+        self.status_message.emit(
+            "Kliknij (Tap) lub przeciągnij (Swipe) na ekranie, aby zastąpić pozycję kroku."
+        )
+
+    def _handle_step_replace(self, kind: str, *coords: int) -> bool:
+        """Podmienia pozycję edytowanego kroku gestem z ekranu (True = obsłużono)."""
+        macro = self._editing_macro()
+        if macro is None or self._editing_step is None or not self._replace_step_mode:
+            return False
+        if self._editing_step >= len(macro.actions):
+            return False
+        action = macro.actions[self._editing_step]
+        if action.get("type") != kind:
+            self.status_message.emit(
+                "Typ kroku nie pasuje do gestu — kliknij dla Tap, przeciągnij dla Swipe."
+            )
+            return True
+        if kind == "tap":
+            action.update(tap_action(coords[0], coords[1]))
+        else:  # swipe
+            action.update(swipe_action(coords[0], coords[1], coords[2], coords[3]))
+        self.config.save_config()
+        self._replace_step_mode = False
+        self.screen_gesture_capture.emit(False)
+        self._refresh_macro_steps()
+        self.status_message.emit(
+            f"Zastąpiono pozycję kroku {self._editing_step + 1} makra '{macro.name}'."
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Zapisywanie akcji

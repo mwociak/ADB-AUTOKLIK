@@ -77,6 +77,7 @@ class AndroidScreenWidget(QWidget):
     point_selected = pyqtSignal(int, int)
     swipe_selected = pyqtSignal(int, int, int, int)
     point_moved = pyqtSignal(str, int, int)  # (name, new_x, new_y) - drag & drop nakładki
+    macro_step_moved = pyqtSignal(str, int, int, int)  # (name, step_index, new_x, new_y)
     stream_started = pyqtSignal(str)
     stream_stopped = pyqtSignal(str)
     stream_error = pyqtSignal(str)
@@ -120,6 +121,12 @@ class AndroidScreenWidget(QWidget):
         self._move_start: QPointF | None = None  # pozycja wciśnięcia (widżet)
         self._move_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
         self._move_origin: tuple[int, int] | None = None  # oryginalna kotwica (telefon)
+
+        # Edycja pojedynczego kroku makra (wyróżnienie + drag kroku)
+        self._edit_macro_name: str | None = None
+        self._edit_step: int | None = None
+        self._move_macro_name: str | None = None
+        self._move_step_index: int | None = None
 
         self._frame_received.connect(self._on_frame_gui)
         self.setMouseTracking(True)
@@ -286,7 +293,8 @@ class AndroidScreenWidget(QWidget):
         if self._phone_size is None:
             return
         if isinstance(point, MacroPoint):
-            self._draw_macro_overlay(painter, point)
+            highlight = self._edit_step if self._edit_macro_name == point.name else None
+            self._draw_macro_overlay_at(painter, point, 0.0, 0.0, highlight_index=highlight)
             return
         if isinstance(point, SwipePoint):
             sx, sy = self._to_widget(point.x1, point.y1)
@@ -306,34 +314,78 @@ class AndroidScreenWidget(QWidget):
         self._draw_macro_overlay_at(painter, point, 0.0, 0.0)
 
     def _draw_macro_overlay_at(
-        self, painter: QPainter, point: MacroPoint, dx: float, dy: float
+        self,
+        painter: QPainter,
+        point: MacroPoint,
+        dx: float,
+        dy: float,
+        highlight_index: int | None = None,
     ) -> None:
-        """Rysuje kroki makra przesunięte o (dx, dy) px (używane przy drag & drop)."""
+        """Rysuje kroki makra przesunięte o (dx, dy); krok ``highlight_index`` wyróżniony."""
         if self._phone_size is None:
             return
         first: tuple[float, float] | None = None
-        for action in point.actions:
+        for index, action in enumerate(point.actions):
             kind = action.get("type")
-            if kind == "tap":
-                x, y = self._to_widget(int(action["x"]), int(action["y"]))
-                x, y = x + dx, y + dy
-                if first is None:
-                    first = (x, y)
+            if kind == "delay":
+                continue
+            anchor = self._macro_step_anchor(action)
+            if anchor is None:
+                continue
+            wx, wy = self._to_widget(*anchor)
+            wx, wy = wx + dx, wy + dy
+            if first is None:
+                first = (wx, wy)
+            self._draw_single_action(
+                painter, action, dx, dy, highlight=(index == highlight_index)
+            )
+        if first is not None:
+            self._draw_overlay_circle(painter, first[0], first[1], point.key)
+
+    @staticmethod
+    def _macro_step_anchor(action: dict) -> tuple[int, int] | None:
+        """Kotwica kroku makra w współrzędnych telefonu (None dla Delay)."""
+        kind = action.get("type")
+        if kind == "tap":
+            return (int(action["x"]), int(action["y"]))
+        if kind == "swipe":
+            return (int(action["x1"]), int(action["y1"]))
+        return None
+
+    def _draw_single_action(
+        self, painter: QPainter, action: dict, dx: float, dy: float, highlight: bool
+    ) -> None:
+        """Rysuje pojedynczy krok makra (tap = kółko, swipe = strzałka) z przesunięciem.
+
+        Przy ``highlight=True`` krok dostaje jaskrawą obwódkę (tryb edycji).
+        """
+        kind = action.get("type")
+        if kind == "tap":
+            x, y = self._to_widget(int(action["x"]), int(action["y"]))
+            x, y = x + dx, y + dy
+            if highlight:
+                painter.setPen(QPen(QColor(255, 96, 96), 3.0))
+                painter.setBrush(QColor(24, 140, 255, 150))
+                painter.drawEllipse(QPointF(x, y), 11.0, 11.0)
+                painter.setPen(QPen(QColor(255, 255, 255, 230), 1.8))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(x, y), 16.0, 16.0)
+            else:
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(24, 140, 255, 90))
                 painter.drawEllipse(QPointF(x, y), 8.0, 8.0)
-            elif kind == "swipe":
-                sx, sy = self._to_widget(int(action["x1"]), int(action["y1"]))
-                ex, ey = self._to_widget(int(action["x2"]), int(action["y2"]))
-                sx, sy = sx + dx, sy + dy
-                ex, ey = ex + dx, ey + dy
-                if first is None:
-                    first = (sx, sy)
-                self._draw_overlay_arrow(
-                    painter, (sx, sy), (ex, ey), _SWIPE_ARROW, width=2.5
-                )
-        if first is not None:
-            self._draw_overlay_circle(painter, first[0], first[1], point.key)
+        elif kind == "swipe":
+            sx, sy = self._to_widget(int(action["x1"]), int(action["y1"]))
+            ex, ey = self._to_widget(int(action["x2"]), int(action["y2"]))
+            sx, sy = sx + dx, sy + dy
+            ex, ey = ex + dx, ey + dy
+            color = QColor(255, 96, 96, 255) if highlight else _SWIPE_ARROW
+            width = 4.0 if highlight else 2.5
+            self._draw_overlay_arrow(painter, (sx, sy), (ex, ey), color, width=width)
+            if highlight:
+                painter.setPen(QPen(QColor(255, 255, 255, 230), 1.8))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(sx, sy), 16.0, 16.0)
 
     def _draw_overlay_circle(self, painter: QPainter, cx: float, cy: float, key: str) -> None:
         """Rysuje półprzezroczyste kółko z literą klawisza w środku."""
@@ -417,6 +469,25 @@ class AndroidScreenWidget(QWidget):
         self._move_point = None
         self._move_start = None
         self._move_current = None
+        self._move_macro_name = None
+        self._move_step_index = None
+        self.update()
+
+    def set_macro_step_edit(self, macro_name: str | None, step_index: int | None) -> None:
+        """Ustawia edytowany krok makra: wyróżnienie + drag pojedynczego kroku.
+
+        ``None``/``None`` czyści tryb edycji kroku. Podczas edycji kroki
+        edytowanego makra można przeciągać indywidualnie (sygnał
+        :attr:`macro_step_moved`); pozostałe punkty nadal przeciąga się
+        jako całość.
+        """
+        self._edit_macro_name = macro_name
+        self._edit_step = step_index
+        self._move_macro_name = None
+        self._move_step_index = None
+        self._move_point = None
+        self._move_start = None
+        self._move_current = None
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
@@ -431,17 +502,27 @@ class AndroidScreenWidget(QWidget):
                     if phone is not None:
                         self.point_selected.emit(*phone)
             else:
-                point = self._hit_test_point(event.position())
-                if point is not None:
-                    self._move_point = point
+                step_hit = self._hit_test_macro_step(event.position())
+                if step_hit is not None:
+                    name, index, anchor = step_hit
+                    self._move_macro_name = name
+                    self._move_step_index = index
                     self._move_start = event.position()
                     self._move_current = event.position()
-                    self._move_origin = self._point_anchor_phone(point)
+                    self._move_origin = anchor
                     self.update()
+                else:
+                    point = self._hit_test_point(event.position())
+                    if point is not None:
+                        self._move_point = point
+                        self._move_start = event.position()
+                        self._move_current = event.position()
+                        self._move_origin = self._point_anchor_phone(point)
+                        self.update()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
-        if self._move_point is not None:
+        if self._move_macro_name is not None or self._move_point is not None:
             self._move_current = event.position()
             self.update()
         elif self._capture_enabled and self._gesture_mode == "swipe" and self._drag_start is not None:
@@ -450,6 +531,27 @@ class AndroidScreenWidget(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if event.button() == Qt.MouseButton.LeftButton and self._move_macro_name is not None:
+            name = self._move_macro_name
+            step_index = self._move_step_index
+            start = self._move_start
+            end = event.position()
+            self._move_macro_name = None
+            self._move_step_index = None
+            self._move_current = None
+            self.update()
+            if start is None or step_index is None:
+                return
+            dx_w = end.x() - start.x()
+            dy_w = end.y() - start.y()
+            dx, dy = self._widget_delta_to_phone(dx_w, dy_w)
+            origin = self._move_origin
+            if origin is None:
+                return
+            nx, ny = self._clamp_phone(origin[0] + round(dx), origin[1] + round(dy))
+            if (nx, ny) != origin:
+                self.macro_step_moved.emit(name, step_index, nx, ny)
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._move_point is not None:
             point = self._move_point
             start = self._move_start
@@ -520,6 +622,38 @@ class AndroidScreenWidget(QWidget):
             return None
         return self._to_widget(*anchor)
 
+    def _overlay_macro(self, name: str) -> MacroPoint | None:
+        """Znajduje makro po nazwie na bieżącej nakładce."""
+        for point in self._overlay_points:
+            if isinstance(point, MacroPoint) and point.name == name:
+                return point
+        return None
+
+    def _hit_test_macro_step(
+        self, pos: QPointF
+    ) -> tuple[str, int, tuple[int, int]] | None:
+        """Trafienie w kółko/strzałkę pojedynczego kroku edytowanego makra.
+
+        Zwraca ``(nazwa_makra, indeks_kroku, kotwica_telefon)`` albo ``None``.
+        """
+        if (
+            self._edit_macro_name is None
+            or self._phone_size is None
+            or self._draw_rect.isNull()
+        ):
+            return None
+        for point in self._overlay_points:
+            if not isinstance(point, MacroPoint) or point.name != self._edit_macro_name:
+                continue
+            for index, action in enumerate(point.actions):
+                anchor = self._macro_step_anchor(action)
+                if anchor is None:
+                    continue
+                wx, wy = self._to_widget(*anchor)
+                if math.hypot(pos.x() - wx, pos.y() - wy) < _DRAG_HIT_RADIUS:
+                    return (point.name, index, anchor)
+        return None
+
     def _hit_test_point(self, pos: QPointF) -> AnyPoint | None:
         """Zwraca punkt nakładki, którego kółko zawiera pozycję myszy (albo ``None``)."""
         if self._phone_size is None or self._draw_rect.isNull():
@@ -552,13 +686,27 @@ class AndroidScreenWidget(QWidget):
 
     def _draw_move_ghost(self, painter: QPainter) -> None:
         """Rysuje "ducha" przeciąganego punktu (podąża za myszą)."""
-        point = self._move_point
         current = self._move_current
         start = self._move_start
-        if point is None or current is None or start is None:
+        if current is None or start is None:
             return
         dx = current.x() - start.x()
         dy = current.y() - start.y()
+        # Drag pojedynczego kroku edytowanego makra
+        if self._move_macro_name is not None:
+            macro = self._overlay_macro(self._move_macro_name)
+            if (
+                macro is not None
+                and self._move_step_index is not None
+                and 0 <= self._move_step_index < len(macro.actions)
+            ):
+                self._draw_single_action(
+                    painter, macro.actions[self._move_step_index], dx, dy, highlight=True
+                )
+            return
+        point = self._move_point
+        if point is None:
+            return
         if isinstance(point, KeyPoint):
             self._draw_overlay_circle(
                 painter, current.x(), current.y(), point.key
