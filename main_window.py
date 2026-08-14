@@ -24,6 +24,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
+    QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -59,6 +60,7 @@ class MainWindow(QMainWindow):
         self.stream.setMinimumWidth(480)
 
         self._macro_runner: MacroRunner | None = None
+        self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
 
         self._build_ui()
         self._wire_signals()
@@ -85,10 +87,26 @@ class MainWindow(QMainWindow):
         scroll.setMaximumWidth(420)
 
         central = QWidget()
-        root = QHBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Górny pasek: wejście do niezależnego modułu Multi-Device Control
+        topbar = QHBoxLayout()
+        topbar.setContentsMargins(8, 6, 8, 2)
+        self.multi_device_button = QPushButton("🌐 Multi-Device Control")
+        self.multi_device_button.setToolTip(
+            "Otwórz farmę urządzeń (Device Grid / Device Wall)"
+        )
+        topbar.addWidget(self.multi_device_button)
+        topbar.addStretch(1)
+        outer.addLayout(topbar)
+
+        root = QHBoxLayout()
         root.setContentsMargins(8, 8, 8, 8)
         root.addWidget(self.stream, 1)
         root.addWidget(scroll)
+        outer.addLayout(root, 1)
         self.setCentralWidget(central)
 
         self.statusBar().showMessage("Gotowy. Wybierz urządzenie i naciśnij 'Połącz'.")
@@ -128,6 +146,23 @@ class MainWindow(QMainWindow):
         )
         st.stream_stopped.connect(self._on_stream_stopped)
         st.stream_error.connect(self._status)
+
+        # Multi-Device Control
+        self.multi_device_button.clicked.connect(self._open_multi_device)
+
+    # ------------------------------------------------------------------
+    # Multi-Device Control
+    # ------------------------------------------------------------------
+
+    def _open_multi_device(self) -> None:
+        """Otwiera (raz, leniwie) niezależne okno Multi-Device Control."""
+        if self._multi_device_window is None:
+            from multi_device_window import MultiDeviceControlWindow
+
+            self._multi_device_window = MultiDeviceControlWindow()
+        self._multi_device_window.show()
+        self._multi_device_window.raise_()
+        self._multi_device_window.activateWindow()
 
     # ------------------------------------------------------------------
     # Połączenie / stream
