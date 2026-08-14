@@ -11,7 +11,8 @@ Widżet zawiera:
   podczas odtwarzania (patrz :meth:`begin_macro_preview`),
 - edycję kroków istniejącego makra: wybór wiersza Macro w tabeli wczytuje
   kroki do listy, kliknięcie kroku aktywuje tryb "Edycja kroku" (zapis
-  zmiany / zastąpienie pozycji gestem z ekranu / drag & drop na nakładce).
+  zmiany / zastąpienie pozycji gestem z ekranu / drag & drop na nakładce),
+  a przycisk "Usuń zaznaczony krok" usuwa krok z makra i zapisuje config.
 
 Komunikacja z resztą aplikacji odbywa się sygnałami Qt:
     mode_changed(str)           - zmieniono typ akcji ("tap"|"swipe"|"macro"),
@@ -398,7 +399,7 @@ class ActionEditor(QWidget):
         self.macro_record_check.setChecked(False)
 
     # ------------------------------------------------------------------
-    # Kroki makra (kompozycja)
+    # Kroki makra (kompozycja / edycja)
     # ------------------------------------------------------------------
 
     def _on_add_delay(self) -> None:
@@ -407,12 +408,42 @@ class ActionEditor(QWidget):
         self._update_add_hint()
 
     def _on_remove_macro_step(self) -> None:
+        """Usuwa zaznaczony krok: z kompozycji nowego makra LUB z edytowanego makra."""
         row = self.macro_steps_list.currentRow()
-        if row < 0 or row >= len(self._macro_steps):
+        if row < 0:
+            self.status_message.emit("Zaznacz krok na liście.")
+            return
+        if self._editing_macro_name:
+            self._remove_editing_macro_step(row)
+            return
+        if row >= len(self._macro_steps):
             return
         del self._macro_steps[row]
         self._refresh_macro_steps()
         self._update_add_hint()
+
+    def _remove_editing_macro_step(self, index: int) -> None:
+        """Usuwa krok z edytowanego makra, zapisuje config i odświeża nakładkę."""
+        macro = self._editing_macro()
+        if macro is None:
+            return
+        if index < 0 or index >= len(macro.actions):
+            return
+        del macro.actions[index]
+        self.config.save_config()
+        # Poprawne zaznaczenie po usunięciu: ten sam indeks albo ostatni krok.
+        if macro.actions:
+            self._editing_step = min(index, len(macro.actions) - 1)
+        else:
+            self._editing_step = None  # makro bez kroków - wyczyść zaznaczenie
+        self._replace_step_mode = False
+        self.screen_gesture_capture.emit(False)
+        self._refresh_macro_steps()
+        if self._editing_step is not None:
+            self.macro_steps_list.setCurrentRow(self._editing_step)
+        self._emit_macro_edit()      # wyróżnienie na nakładce (aktualny krok)
+        self.points_changed.emit()   # przeładowanie nakładki - krok znika na żywo
+        self.status_message.emit(f"Usunięto krok {index + 1} makra '{macro.name}'.")
 
     def _steps_source(self) -> list[dict]:
         """Kroki do wyświetlenia: edytowane makro > podgląd odtwarzania > kompozycja."""
