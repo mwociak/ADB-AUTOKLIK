@@ -398,6 +398,23 @@ class ActionEditor(QWidget):
         self.add_mode_check.setChecked(False)
         self.macro_record_check.setChecked(False)
 
+    def enable_capture(self) -> None:
+        """Włącza przechwytywanie gestów (tryb Mapowania akcji).
+
+        Zaznacza właściwy przełącznik w zależności od wybranego typu akcji:
+        ``add_mode_check`` dla Tap/Swipe, ``macro_record_check`` dla Makra.
+        Zmiana stanu checkboxa emituje ``capture_mode_changed``, więc
+        stream i keymapper zsynchronizują się automatycznie.
+        """
+        if self._gesture_kind() == "macro":
+            self.add_mode_check.setChecked(False)  # tylko jeden tryb naraz
+            if not self.macro_record_check.isChecked():
+                self.macro_record_check.setChecked(True)
+        else:
+            self.macro_record_check.setChecked(False)
+            if not self.add_mode_check.isChecked():
+                self.add_mode_check.setChecked(True)
+
     # ------------------------------------------------------------------
     # Kroki makra (kompozycja / edycja)
     # ------------------------------------------------------------------

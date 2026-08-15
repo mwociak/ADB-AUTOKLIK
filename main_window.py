@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QHBoxLayout,
     QMainWindow,
     QPushButton,
@@ -37,7 +38,7 @@ from device_panel import DevicePanel
 from keymapper_widget import KeymapperWidget
 from macro_runner import MacroRunner
 from nav_bar_widget import NavigationBar, NavigationWorker
-from stream_widget import AndroidScreenWidget
+from stream_widget import CONTROL_SWIPE_DURATION_MS, AndroidScreenWidget, ControlWorker
 
 _STATUS_TIMEOUT_MS = 6000
 
@@ -63,6 +64,7 @@ class MainWindow(QMainWindow):
 
         self._macro_runner: MacroRunner | None = None
         self._nav_worker: NavigationWorker | None = None
+        self._control_worker: ControlWorker | None = None
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
 
         self._build_ui()
@@ -94,15 +96,31 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Górny pasek: wejście do niezależnego modułu Multi-Device Control
+        # Górny pasek: tryb streamu (Sterowanie/Mapowanie) + Multi-Device Control
         topbar = QHBoxLayout()
         topbar.setContentsMargins(8, 6, 8, 2)
+        self.control_btn = QPushButton("🎮 Sterowanie")
+        self.control_btn.setCheckable(True)
+        self.control_btn.setChecked(True)
+        self.control_btn.setToolTip(
+            "Mysz steruje telefonem: klik = tap, przeciągnięcie = swipe (przez ADB)"
+        )
+        self.map_btn = QPushButton("➕ Mapowanie")
+        self.map_btn.setCheckable(True)
+        self.map_btn.setToolTip(
+            "Kliknięcia/gesty definiują akcje keymapy (dodawanie Tap/Swipe/Makro)"
+        )
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.control_btn)
+        self.mode_group.addButton(self.map_btn)
+        topbar.addWidget(self.control_btn)
+        topbar.addWidget(self.map_btn)
+        topbar.addStretch(1)
         self.multi_device_button = QPushButton("🌐 Multi-Device Control")
         self.multi_device_button.setToolTip(
             "Otwórz farmę urządzeń (Device Grid / Device Wall)"
         )
         topbar.addWidget(self.multi_device_button)
-        topbar.addStretch(1)
         outer.addLayout(topbar)
 
         # Kolumna streamu: podgląd telefonu + pasek nawigacji pod spodem
@@ -151,8 +169,14 @@ class MainWindow(QMainWindow):
         # Stream -> edytor (gesty) oraz status
         st.point_selected.connect(ae.on_screen_clicked)
         st.swipe_selected.connect(ae.on_swipe_selected)
+        st.control_tap.connect(self._on_control_tap)
+        st.control_swipe.connect(self._on_control_swipe)
         st.point_moved.connect(self._on_point_moved)
         st.macro_step_moved.connect(self._on_macro_step_moved)
+
+        # Przełącznik trybu streamu (Sterowanie / Mapowanie)
+        self.control_btn.clicked.connect(lambda: self._set_stream_mode(False))
+        self.map_btn.clicked.connect(lambda: self._set_stream_mode(True))
         st.stream_started.connect(
             lambda serial: self._status(f"Stream uruchomiony: {serial}")
         )
@@ -215,6 +239,29 @@ class MainWindow(QMainWindow):
         self._status(message)
 
     # ------------------------------------------------------------------
+    # Interaktywne sterowanie streamem (tap/swipe przez ADB, w tle)
+    # ------------------------------------------------------------------
+
+    def _on_control_tap(self, x: int, y: int) -> None:
+        self._run_control("tap", (x, y))
+
+    def _on_control_swipe(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        self._run_control("swipe", (x1, y1, x2, y2, CONTROL_SWIPE_DURATION_MS))
+
+    def _run_control(self, kind: str, args: tuple[int, ...]) -> None:
+        """Wykonuje gest sterowania w osobnym wątku (nie blokuje GUI)."""
+        if self.adb.device_serial is None:
+            return
+        worker = ControlWorker(self.adb, kind, args)
+        worker.finished.connect(self._on_control_finished)
+        self._control_worker = worker
+        worker.start()
+
+    def _on_control_finished(self, ok: bool) -> None:
+        """Wynik gestu sterowania -> LED ADB."""
+        self.device_panel.set_adb_status("ok" if ok else "error")
+
+    # ------------------------------------------------------------------
     # Tryby edytora -> stream i keymapper
     # ------------------------------------------------------------------
 
@@ -223,8 +270,27 @@ class MainWindow(QMainWindow):
         self.stream.set_gesture_mode("swipe" if kind in ("swipe", "macro") else "tap")
 
     def _on_capture_mode_changed(self, active: bool) -> None:
+        """Tryb przechwytywania zmieniony (checkboxy edytora / zapis akcji).
+
+        Synchronizuje stream, keymapper i przyciski Sterowanie/Mapowanie.
+        """
         self.stream.set_capture_enabled(active)
         self.keymapper_widget.set_add_mode(active)
+        self.control_btn.setChecked(not active)
+        self.map_btn.setChecked(active)
+
+    def _set_stream_mode(self, mapping: bool) -> None:
+        """Przełącza tryb streamu: False = Sterowanie, True = Mapowanie."""
+        if mapping:
+            self.action_editor.enable_capture()
+        else:
+            self.action_editor.disable_capture()
+        # Bezpośrednio, gdy checkboxy edytora już były w docelowym stanie
+        # (żaden toggled nie wystrzeli) - stan streamu musi być spójny.
+        self.stream.set_capture_enabled(mapping)
+        self.keymapper_widget.set_add_mode(mapping)
+        self.control_btn.setChecked(not mapping)
+        self.map_btn.setChecked(mapping)
 
     def _on_points_changed(self) -> None:
         """Zestaw akcji się zmienił - odśwież nakładkę na streamie."""

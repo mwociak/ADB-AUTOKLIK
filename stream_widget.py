@@ -28,7 +28,7 @@ import threading
 
 import numpy as np
 import scrcpy
-from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget
 
@@ -57,6 +57,10 @@ _SWIPE_END_RADIUS = 5.0
 _SWIPE_MIN_DRAG_PX = 10
 # Promień trafienia [px] przy chwytaniu punktu nakładki (drag & drop).
 _DRAG_HIT_RADIUS = 26.0
+# Czas trwania gestu sterowania (interaktywne sterowanie myszą) [ms].
+CONTROL_SWIPE_DURATION_MS = 250
+# Kolor podglądu przeciągania w trybie sterowania (odróżnialny od gestu mapowania).
+_CONTROL_DRAG_PREVIEW = QColor(79, 209, 255, 200)
 # Nazwa pliku serwera scrcpy (jar), wgrywanego na telefon przez ADB.
 _SCRCPY_SERVER_FILE = "scrcpy-server.jar"
 
@@ -119,8 +123,51 @@ def ensure_scrcpy_server() -> str | None:
         return source
 
 
+class ControlWorker(QObject, threading.Thread):
+    """Wykonuje pojedynczy gest sterowania (tap/swipe) w osobnym wątku.
+
+    Interaktywne sterowanie streamem nie może blokować pętli zdarzeń PyQt6
+    (komenda ``input tap/swipe`` na martwym urządzeniu potrafi czekać do
+    timeoutu), dlatego wykonanie odbywa się w wątku roboczym (daemon),
+    a wynik wraca sygnałem ``finished(bool)`` do aktualizacji LED ADB.
+    """
+
+    finished = pyqtSignal(bool)
+
+    def __init__(
+        self, adb: "ADBController", kind: str, args: tuple[int, ...]
+    ) -> None:
+        QObject.__init__(self)
+        threading.Thread.__init__(self, daemon=True, name=f"control-{kind}")
+        self._adb = adb
+        self._kind = kind
+        self._args = tuple(args)
+
+    def run(self) -> None:
+        try:
+            if self._kind == "tap":
+                ok = self._adb.tap(*self._args)
+            elif self._kind == "swipe":
+                ok = self._adb.swipe(*self._args)
+            else:
+                ok = False
+        except Exception as exc:  # noqa: BLE001 - komenda nie może wywalać wątku
+            ok = False
+            print(f"[ControlWorker] Błąd akcji '{self._kind}': {exc}", file=sys.stderr)
+        self.finished.emit(ok)
+
+
 class AndroidScreenWidget(QWidget):
     """Wyświetla strumień wideo z telefonu i przelicza gesty myszy na współrzędne.
+
+    Tryby obsługi myszy (patrz :attr:`interactive_control_mode`):
+        - tryb **Sterowania** (domyślnie): klik = ``control_tap``,
+          przeciągnięcie = ``control_swipe`` (gesty wysyłane do ADB),
+        - tryb **Mapowania** (przechwytywanie gestów, ``set_capture_enabled``):
+          kliknięcia/przeciągnięcia trafiają do edytora akcji
+          (``point_selected`` / ``swipe_selected``).
+    W obu trybach wciśnięcie LPM dokładnie na kółku punktu nakładki
+    przeciąga ten punkt (drag & drop).
 
     Sygnały:
         point_selected(int, int): kliknięcie na obrazie telefonu,
@@ -128,6 +175,8 @@ class AndroidScreenWidget(QWidget):
         swipe_selected(int, int, int, int): przeciągnięcie myszą na
             obrazie telefonu; argumenty to (x1, y1, x2, y2) - rzeczywiste
             współrzędne startu i końca gestu.
+        control_tap(int, int): tap sterowania (natywne współrzędne telefonu).
+        control_swipe(int, int, int, int): swipe sterowania (x1, y1, x2, y2).
         stream_started(str): stream dla danego serialu został uruchomiony.
         stream_stopped(str): stream zatrzymany; argument to powód
             ("" przy normalnym zatrzymaniu, inaczej opis błędu/odłączenia).
@@ -140,6 +189,8 @@ class AndroidScreenWidget(QWidget):
 
     point_selected = pyqtSignal(int, int)
     swipe_selected = pyqtSignal(int, int, int, int)
+    control_tap = pyqtSignal(int, int)
+    control_swipe = pyqtSignal(int, int, int, int)
     point_moved = pyqtSignal(str, int, int)  # (name, new_x, new_y) - drag & drop nakładki
     macro_step_moved = pyqtSignal(str, int, int, int)  # (name, step_index, new_x, new_y)
     stream_started = pyqtSignal(str)
@@ -178,6 +229,11 @@ class AndroidScreenWidget(QWidget):
         self._gesture_mode = "tap"
         self._drag_start: QPointF | None = None  # pozycja wciśnięcia LPM (widżet)
         self._drag_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
+
+        # Interaktywne sterowanie (domyślnie włączone): klik = tap, przeciągnij = swipe
+        self._interactive_control = True
+        self._ctrl_start: QPointF | None = None  # start gestu sterowania (widżet)
+        self._ctrl_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
 
         # Drag & drop punktów nakładki (aktywne, gdy przechwytywanie gestów wyłączone)
         self._capture_enabled = False
@@ -340,7 +396,7 @@ class AndroidScreenWidget(QWidget):
             self._draw_rect = rect
             for point in self._overlay_points:
                 self._draw_overlay_point(painter, point)
-            # Podgląd przeciągania myszą (tryb swipe)
+            # Podgląd przeciągania myszą (tryb swipe / mapowanie)
             if self._drag_start is not None and self._drag_current is not None:
                 self._draw_overlay_arrow(
                     painter,
@@ -348,6 +404,15 @@ class AndroidScreenWidget(QWidget):
                     (self._drag_current.x(), self._drag_current.y()),
                     _DRAG_PREVIEW,
                     width=2.0,
+                )
+            # Podgląd przeciągania w trybie sterowania (gest na telefonie)
+            if self._ctrl_start is not None and self._ctrl_current is not None:
+                self._draw_overlay_arrow(
+                    painter,
+                    (self._ctrl_start.x(), self._ctrl_start.y()),
+                    (self._ctrl_current.x(), self._ctrl_current.y()),
+                    _CONTROL_DRAG_PREVIEW,
+                    width=2.5,
                 )
             # Podgląd przeciągania punktu nakładki (drag & drop)
             if self._move_point is not None and self._move_current is not None:
@@ -531,18 +596,40 @@ class AndroidScreenWidget(QWidget):
 
         Gdy przechwytywanie jest włączone (tryb dodawania tap/swipe lub
         nagrywanie makra), kliknięcia/przeciągnięcia na ekranie są
-        zamieniane na sygnały :attr:`point_selected` / :attr:`swipe_selected`.
-        Gdy wyłączone - mysz służy do chwytania i przeciągania punktów
-        nakładki (drag & drop; patrz :attr:`point_moved`).
+        zamieniane na sygnały :attr:`point_selected` / :attr:`swipe_selected`
+        (tryb **Mapowania**). Gdy wyłączone - mysz służy do interaktywnego
+        sterowania telefonem (tap/swipe przez ADB, patrz
+        :attr:`interactive_control_mode`) oraz drag & drop punktów nakładki.
+
+        Automatyczne przełączanie trybów: rozpoczęcie dodawania akcji
+        przełącza na Mapowanie, a wyjście z trybu dodawania (np. po zapisie)
+        wraca do Sterowania.
         """
         self._capture_enabled = bool(enabled)
+        # Auto-przełączanie: dodawanie akcji = Mapowanie, powrót = Sterowanie.
+        self._interactive_control = not self._capture_enabled
         self._drag_start = None
         self._drag_current = None
+        self._ctrl_start = None
+        self._ctrl_current = None
         self._move_point = None
         self._move_start = None
         self._move_current = None
         self._move_macro_name = None
         self._move_step_index = None
+        self.update()
+
+    @property
+    def interactive_control_mode(self) -> bool:
+        """``True`` = tryb Sterowania (mysz steruje telefonem przez ADB)."""
+        return self._interactive_control
+
+    @interactive_control_mode.setter
+    def interactive_control_mode(self, enabled: bool) -> None:
+        """Ustawia tryb sterowania (False = Mapowanie/przechwytywanie gestów)."""
+        self._interactive_control = bool(enabled)
+        self._ctrl_start = None
+        self._ctrl_current = None
         self.update()
 
     def set_macro_step_edit(self, macro_name: str | None, step_index: int | None) -> None:
@@ -574,6 +661,8 @@ class AndroidScreenWidget(QWidget):
                     if phone is not None:
                         self.point_selected.emit(*phone)
             else:
+                # Drag & drop punktów nakładki ma priorytet nad sterowaniem:
+                # wciśnięcie dokładnie na kółku punktu przeciąga ten punkt.
                 step_hit = self._hit_test_macro_step(event.position())
                 if step_hit is not None:
                     name, index, anchor = step_hit
@@ -591,6 +680,12 @@ class AndroidScreenWidget(QWidget):
                         self._move_current = event.position()
                         self._move_origin = self._point_anchor_phone(point)
                         self.update()
+                    elif self._interactive_control:
+                        # Tryb sterowania: zapamiętaj start gestu (tap vs swipe
+                        # rozstrzyga się przy puszczeniu przycisku).
+                        self._ctrl_start = event.position()
+                        self._ctrl_current = event.position()
+                        self.update()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
@@ -599,6 +694,9 @@ class AndroidScreenWidget(QWidget):
             self.update()
         elif self._capture_enabled and self._gesture_mode == "swipe" and self._drag_start is not None:
             self._drag_current = event.position()
+            self.update()
+        elif self._interactive_control and self._ctrl_start is not None:
+            self._ctrl_current = event.position()
             self.update()
         super().mouseMoveEvent(event)
 
@@ -662,6 +760,25 @@ class AndroidScreenWidget(QWidget):
                 self.swipe_selected.emit(*p1, *p2)
             else:
                 self.point_selected.emit(*p1)  # klik bez przeciągnięcia = tap
+            return
+        if (
+            self._interactive_control
+            and self._ctrl_start is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            start = self._ctrl_start
+            end = event.position()
+            self._ctrl_start = None
+            self._ctrl_current = None
+            self.update()
+            p1 = self._to_phone(start)
+            p2 = self._to_phone(end)
+            if p1 is None or p2 is None:
+                return
+            if math.hypot(end.x() - start.x(), end.y() - start.y()) >= _SWIPE_MIN_DRAG_PX:
+                self.control_swipe.emit(*p1, *p2)  # gest sterowania (swipe)
+            else:
+                self.control_tap.emit(*p1)  # gest sterowania (tap)
         super().mouseReleaseEvent(event)
 
     # ------------------------------------------------------------------
