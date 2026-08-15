@@ -61,6 +61,9 @@ _DRAG_HIT_RADIUS = 26.0
 CONTROL_SWIPE_DURATION_MS = 250
 # Kolor podglądu przeciągania w trybie sterowania (odróżnialny od gestu mapowania).
 _CONTROL_DRAG_PREVIEW = QColor(79, 209, 255, 200)
+# Podgląd zaznaczonego prostokąta (zapisywanie wzorca, np. dla Ad Killer).
+_RECT_CAPTURE_FILL = QColor(79, 209, 255, 50)
+_RECT_CAPTURE_BORDER = QColor(79, 209, 255, 230)
 # Nazwa pliku serwera scrcpy (jar), wgrywanego na telefon przez ADB.
 _SCRCPY_SERVER_FILE = "scrcpy-server.jar"
 
@@ -191,6 +194,7 @@ class AndroidScreenWidget(QWidget):
     swipe_selected = pyqtSignal(int, int, int, int)
     control_tap = pyqtSignal(int, int)
     control_swipe = pyqtSignal(int, int, int, int)
+    rect_selected = pyqtSignal(int, int, int, int)  # (x1, y1, x2, y2) - natywne współrzędne
     point_moved = pyqtSignal(str, int, int)  # (name, new_x, new_y) - drag & drop nakładki
     macro_step_moved = pyqtSignal(str, int, int, int)  # (name, step_index, new_x, new_y)
     stream_started = pyqtSignal(str)
@@ -221,6 +225,11 @@ class AndroidScreenWidget(QWidget):
         self._phone_size: tuple[int, int] | None = None  # (width, height) telefonu
         self._draw_rect = QRectF()  # prostokąt rysowania (letterbox) w koordynatach widżetu
         self._frame_pending = False
+        # Ostatnia klatka (BGR, kopia) dla modułów zewnętrznych (np. Ad Killer).
+        # Wymieniana w wątku GUI, czytana z innych wątków przez get_latest_frame()
+        # - dostęp synchronizowany lockiem.
+        self._frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
 
         # Nakładka (akcje keymapy: tapy, swipe'y i makra)
         self._overlay_points: list[KeyPoint | SwipePoint | MacroPoint] = []
@@ -229,6 +238,12 @@ class AndroidScreenWidget(QWidget):
         self._gesture_mode = "tap"
         self._drag_start: QPointF | None = None  # pozycja wciśnięcia LPM (widżet)
         self._drag_current: QPointF | None = None  # aktualna pozycja myszy (podgląd)
+
+        # Przechwytywanie prostokąta z ekranu (np. wzorce dla Ad Killer):
+        # następny przeciągnięty prostokąt emituje rect_selected (natywne współrzędne).
+        self._rect_capture_enabled = False
+        self._rect_start: QPointF | None = None
+        self._rect_current: QPointF | None = None
 
         # Interaktywne sterowanie (domyślnie włączone): klik = tap, przeciągnij = swipe
         self._interactive_control = True
@@ -268,6 +283,8 @@ class AndroidScreenWidget(QWidget):
             self.stop_stream()
         self._serial = serial
         self._pixmap = None
+        with self._frame_lock:
+            self._latest_frame = None
         self._phone_size = self._query_phone_size(serial)
         self._client_thread = threading.Thread(
             target=self._run_client,
@@ -293,6 +310,8 @@ class AndroidScreenWidget(QWidget):
         ):
             self._client_thread.join(timeout=2.0)
         self._client_thread = None
+        with self._frame_lock:
+            self._latest_frame = None
         self.stream_stopped.emit("")
 
     def _run_client(self, serial: str) -> None:
@@ -359,6 +378,8 @@ class AndroidScreenWidget(QWidget):
     def _on_disconnect_thread(self, *args: object) -> None:
         """Urządzenie odłączone lub stream przerwany (wątek scrcpy)."""
         self._client = None
+        with self._frame_lock:
+            self._latest_frame = None
         self.stream_stopped.emit("Urządzenie zostało odłączone lub stream został przerwany")
 
     def _on_frame_gui(self, frame: np.ndarray) -> None:
@@ -367,11 +388,26 @@ class AndroidScreenWidget(QWidget):
         h, w = frame.shape[:2]
         if self._phone_size is None:
             self._phone_size = (w, h)
+        # Kopia surowej klatki (BGR) dla modułów zewnętrznych (np. Ad Killer) -
+        # dostęp z innych wątków przez get_latest_frame() (lock wewnętrzny).
+        with self._frame_lock:
+            self._latest_frame = frame.copy()
         image = QImage(
             frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888
         ).rgbSwapped()  # klatki są BGR24 -> zamiana na RGB
         self._pixmap = QPixmap.fromImage(image)
         self.update()
+
+    def get_latest_frame(self) -> np.ndarray | None:
+        """Zwraca kopię ostatniej klatki streamu (BGR) albo ``None``.
+
+        Bezpieczna dla wątków (wewnętrzny lock) - używana przez moduły
+        działające w osobnych wątkach (np. Ad Killer).
+        """
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
 
     # ------------------------------------------------------------------
     # Rysowanie i skalowanie (letterbox)
@@ -414,6 +450,12 @@ class AndroidScreenWidget(QWidget):
                     _CONTROL_DRAG_PREVIEW,
                     width=2.5,
                 )
+            # Podgląd zaznaczonego prostokąta (zapisywanie wzorca, np. Ad Killer)
+            if self._rect_start is not None and self._rect_current is not None:
+                rect = QRectF(self._rect_start, self._rect_current).normalized()
+                painter.fillRect(rect, _RECT_CAPTURE_FILL)
+                painter.setPen(QPen(_RECT_CAPTURE_BORDER, 2.0, Qt.PenStyle.DashLine))
+                painter.drawRect(rect)
             # Podgląd przeciągania punktu nakładki (drag & drop)
             if self._move_point is not None and self._move_current is not None:
                 self._draw_move_ghost(painter)
@@ -619,6 +661,31 @@ class AndroidScreenWidget(QWidget):
         self._move_step_index = None
         self.update()
 
+    def set_rect_capture(self, enabled: bool) -> None:
+        """Włącza/wyłącza tryb zaznaczania prostokąta myszą.
+
+        Gdy aktywny, następne przeciągnięcie na podglądzie emituje
+        :attr:`rect_selected` z natywnymi współrzędnymi (x1, y1, x2, y2) -
+        służy np. do zapisywania wzorców "X" dla modułu Ad Killer. W tym
+        trybie wyłączone są sterowanie, mapowanie i drag & drop nakładki.
+        """
+        self._rect_capture_enabled = bool(enabled)
+        self._rect_start = None
+        self._rect_current = None
+        if enabled:
+            # Nie pozwól, by równoległe tryby (sterowanie/mapowanie/drag)
+            # dokończyły swój gest w trakcie zaznaczania prostokąta.
+            self._ctrl_start = None
+            self._ctrl_current = None
+            self._drag_start = None
+            self._drag_current = None
+            self._move_point = None
+            self._move_start = None
+            self._move_current = None
+            self._move_macro_name = None
+            self._move_step_index = None
+        self.update()
+
     @property
     def interactive_control_mode(self) -> bool:
         """``True`` = tryb Sterowania (mysz steruje telefonem przez ADB)."""
@@ -651,7 +718,11 @@ class AndroidScreenWidget(QWidget):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._capture_enabled:
+            if self._rect_capture_enabled:
+                self._rect_start = event.position()
+                self._rect_current = event.position()
+                self.update()
+            elif self._capture_enabled:
                 if self._gesture_mode == "swipe":
                     self._drag_start = event.position()
                     self._drag_current = event.position()
@@ -689,7 +760,10 @@ class AndroidScreenWidget(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
-        if self._move_macro_name is not None or self._move_point is not None:
+        if self._rect_capture_enabled and self._rect_start is not None:
+            self._rect_current = event.position()
+            self.update()
+        elif self._move_macro_name is not None or self._move_point is not None:
             self._move_current = event.position()
             self.update()
         elif self._capture_enabled and self._gesture_mode == "swipe" and self._drag_start is not None:
@@ -701,6 +775,25 @@ class AndroidScreenWidget(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._rect_capture_enabled
+            and self._rect_start is not None
+        ):
+            start = self._rect_start
+            end = event.position()
+            self._rect_start = None
+            self._rect_current = None
+            self.update()
+            p1 = self._to_phone(start)
+            p2 = self._to_phone(end)
+            if p1 is None or p2 is None:
+                return
+            x1, y1 = min(p1[0], p2[0]), min(p1[1], p2[1])
+            x2, y2 = max(p1[0], p2[0]), max(p1[1], p2[1])
+            if x2 - x1 >= 10 and y2 - y1 >= 10:
+                self.rect_selected.emit(x1, y1, x2, y2)
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._move_macro_name is not None:
             name = self._move_macro_name
             step_index = self._move_step_index

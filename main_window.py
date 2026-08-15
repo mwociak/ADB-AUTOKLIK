@@ -23,6 +23,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QHBoxLayout,
     QMainWindow,
     QPushButton,
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from action_editor import ActionEditor, _plural_steps
+from ad_killer_module import AdKillerWorker
 from adb_controller import ADBController
 from config_manager import ConfigManager, MacroPoint, SwipePoint
 from device_panel import DevicePanel
@@ -66,6 +68,8 @@ class MainWindow(QMainWindow):
         self._nav_worker: NavigationWorker | None = None
         self._control_worker: ControlWorker | None = None
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
+        self._ad_killer: AdKillerWorker | None = None
+        self._ad_killer_dialog = None  # AdKillerConfigDialog (tworzony leniwie)
 
         self._build_ui()
         self._wire_signals()
@@ -115,7 +119,17 @@ class MainWindow(QMainWindow):
         self.mode_group.addButton(self.map_btn)
         topbar.addWidget(self.control_btn)
         topbar.addWidget(self.map_btn)
+        self.ad_killer_check = QCheckBox("🛡️ Auto-Zamykanie [WYŁ]")
+        self.ad_killer_check.setToolTip(
+            "Automatycznie zamyka reklamy (OpenCV Template Matching)"
+        )
+        topbar.addWidget(self.ad_killer_check)
         topbar.addStretch(1)
+        self.ad_killer_config_button = QPushButton("🛡️ Ad Killer Config")
+        self.ad_killer_config_button.setToolTip(
+            "Konfiguracja Ad Killer: wzorce reklam, czułość, interwał skanowania"
+        )
+        topbar.addWidget(self.ad_killer_config_button)
         self.multi_device_button = QPushButton("🌐 Multi-Device Control")
         self.multi_device_button.setToolTip(
             "Otwórz farmę urządzeń (Device Grid / Device Wall)"
@@ -189,6 +203,10 @@ class MainWindow(QMainWindow):
         # Multi-Device Control
         self.multi_device_button.clicked.connect(self._open_multi_device)
 
+        # Ad Killer (automatyczne zamykanie reklam)
+        self.ad_killer_check.toggled.connect(self._on_ad_killer_toggled)
+        self.ad_killer_config_button.clicked.connect(self._open_ad_killer_config)
+
     # ------------------------------------------------------------------
     # Multi-Device Control
     # ------------------------------------------------------------------
@@ -202,6 +220,74 @@ class MainWindow(QMainWindow):
         self._multi_device_window.show()
         self._multi_device_window.raise_()
         self._multi_device_window.activateWindow()
+
+    # ------------------------------------------------------------------
+    # Ad Killer (automatyczne zamykanie reklam - niezależny moduł)
+    # ------------------------------------------------------------------
+
+    def _open_ad_killer_config(self) -> None:
+        """Otwiera (raz, leniwie) okno konfiguracji Ad Killer."""
+        if self._ad_killer_dialog is None:
+            from ad_killer_ui import AdKillerConfigDialog
+
+            self._ad_killer_dialog = AdKillerConfigDialog(self.stream)
+            self._ad_killer_dialog.settings_changed.connect(
+                self._on_ad_killer_settings
+            )
+            self._ad_killer_dialog.templates_changed.connect(
+                self._on_ad_templates_changed
+            )
+        self._ad_killer_dialog.show()
+        self._ad_killer_dialog.raise_()
+        self._ad_killer_dialog.activateWindow()
+
+    def _on_ad_killer_toggled(self, checked: bool) -> None:
+        """Start/zatrzymanie workera Ad Killer (checkbox na pasku)."""
+        self.ad_killer_check.setText(
+            "🛡️ Auto-Zamykanie [WŁ]" if checked else "🛡️ Auto-Zamykanie [WYŁ]"
+        )
+        if checked:
+            threshold = 0.8
+            interval_ms = 1500
+            if self._ad_killer_dialog is not None:
+                threshold = self._ad_killer_dialog.threshold
+                interval_ms = self._ad_killer_dialog.interval_ms
+            worker = AdKillerWorker(
+                self.adb,
+                self.stream,
+                threshold=threshold,
+                interval_ms=interval_ms,
+            )
+            worker.detected.connect(self._on_ad_detected)
+            worker.status_message.connect(self._status)
+            self._ad_killer = worker
+            worker.start()
+            self._status(
+                f"🛡️ Ad Killer aktywny (próg {threshold:.0%}, co {interval_ms} ms)"
+            )
+        else:
+            worker = self._ad_killer
+            self._ad_killer = None
+            if worker is not None:
+                worker.stop()
+                worker.wait(3000)
+            self._status("🛡️ Ad Killer wyłączony.")
+
+    def _on_ad_killer_settings(self, threshold: float, interval_ms: int) -> None:
+        """Aplikuje zmiany ustawień z okna konfiguracji do działającego workera."""
+        if self._ad_killer is not None:
+            self._ad_killer.set_threshold(threshold)
+            self._ad_killer.set_interval_ms(interval_ms)
+
+    def _on_ad_templates_changed(self) -> None:
+        """Dodano wzorzec - przeładuj listę w działającym workerce."""
+        if self._ad_killer is not None:
+            self._ad_killer.reload_templates()
+
+    def _on_ad_detected(self, x: int, y: int) -> None:
+        """Wykryto i zamknięto reklamę - LED ADB + komunikat."""
+        self.device_panel.set_adb_status("ok")
+        self._status(f"🛡️ Wykryto i zamknięto reklamę ({x}, {y})")
 
     # ------------------------------------------------------------------
     # Połączenie / stream
@@ -415,6 +501,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
         if self._macro_runner is not None:
             self._macro_runner.stop()
+        if self._ad_killer is not None:
+            self._ad_killer.stop()
         self.keymapper_widget.stop()
         self.stream.stop_stream()
         super().closeEvent(event)

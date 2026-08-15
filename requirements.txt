@@ -28,3 +28,6 @@ scrcpy-client @ git+https://github.com/leng-yue/py-scrcpy-client.git@ad57b15934c
 # Dekoder wideo (PyAV) i numpy - zależności scrcpy-client do ramek obrazu
 av>=12
 numpy>=2
+
+# Wykrywanie wzorców (Template Matching) dla modułu Ad Killer
+opencv-python>=4.8
