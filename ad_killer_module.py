@@ -36,6 +36,11 @@ from PyQt6.QtCore import QThread, pyqtSignal
 DEFAULT_SCALES = (0.6, 0.8, 1.0, 1.25, 1.5)
 
 
+def _log(message: str) -> None:
+    """Log diagnostyczny Ad Killer (stderr - nie miesza się ze stdout)."""
+    print(f"[AdKillerWorker] {message}", file=sys.stderr)
+
+
 def default_templates_dir() -> str:
     """Zwraca domyślny katalog wzorców Ad Killer (``ad_templates/``).
 
@@ -107,6 +112,9 @@ class AdKillerWorker(QThread):
         self._interval_ms = max(100, int(interval_ms))
         self._cooldown_s = max(0.0, float(cooldown_s))
         self._templates: list[tuple[str, np.ndarray]] = []
+        # Sygnatura (lista plików) katalogu wzorców - do wykrywania zmian
+        # na dysku bez cache z czasu startu aplikacji.
+        self._dir_signature: list[str] | None = None
 
     # ------------------------------------------------------------------
     # Parametry (bezpieczne wywołania z wątku GUI)
@@ -123,10 +131,17 @@ class AdKillerWorker(QThread):
             self._interval_ms = max(100, int(interval_ms))
 
     def reload_templates(self) -> None:
-        """Przeładowuje listę wzorców PNG z katalogu (bezpieczne z GUI)."""
+        """Przeładowuje listę wzorców PNG z katalogu (bezpieczne z GUI).
+
+        Wywoływane przy każdym starcie workera, po zmianie plików w katalogu
+        oraz z okna konfiguracji - wzorce NIGDY nie pochodzą z cache
+        utworzonego przy starcie aplikacji.
+        """
         templates: list[tuple[str, np.ndarray]] = []
+        names: list[str] = []
         if os.path.isdir(self._templates_dir):
             for name in sorted(os.listdir(self._templates_dir)):
+                names.append(name)
                 if not name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
                     continue
                 path = os.path.join(self._templates_dir, name)
@@ -136,22 +151,47 @@ class AdKillerWorker(QThread):
                 templates.append((name, image))
         with self._lock:
             self._templates = templates
+            self._dir_signature = names
         if templates:
+            loaded = ", ".join(name for name, _ in templates)
+            _log(f"Wczytano {len(templates)} wzorców z {self._templates_dir}/: {loaded}")
             self.status_message.emit(
                 f"🛡️ Wczytano {len(templates)} wzorców reklam z {self._templates_dir}/"
             )
         else:
+            _log(f"Brak wzorców w katalogu {self._templates_dir}/")
             self.status_message.emit(
                 f"🛡️ Brak wzorców w katalogu {self._templates_dir}/"
             )
+
+    def _templates_changed_on_disk(self) -> bool:
+        """``True``, gdy lista plików w katalogu wzorców się zmieniła.
+
+        Tani check (``os.listdir``) wykonywany co cykl skanowania; pełne
+        przeładowanie (``imread``) tylko przy faktycznej zmianie, więc
+        wzorce dodane/usunięte ręcznie są podchwytywane na żywo.
+        """
+        try:
+            names = sorted(os.listdir(self._templates_dir))
+        except OSError:
+            names = []
+        with self._lock:
+            if names == self._dir_signature:
+                return False
+            self._dir_signature = names
+            return True
 
     # ------------------------------------------------------------------
     # Cykl skanowania
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        # Lista wzorców wczytywana NA NOWO przy każdym starcie workera
+        # (a także na żywo przy zmianach plików - patrz pętla poniżej).
         self.reload_templates()
         while not self._stop_event.is_set():
+            if self._templates_changed_on_disk():
+                self.reload_templates()
             frame = self._stream.get_latest_frame()
             if frame is None:
                 # Brak streamu/klatki - poczekaj i spróbuj ponownie.
@@ -160,18 +200,29 @@ class AdKillerWorker(QThread):
             with self._lock:
                 templates = list(self._templates)
                 threshold = self._threshold
+            best_name: str | None = None
             best_center: tuple[int, int] | None = None
             best_score = threshold  # szukamy dopasowania powyżej progu
-            for _name, template in templates:
+            for name, template in templates:
                 match = find_best_match(frame, template)
                 if match is None:
                     continue
                 score, cx, cy = match
+                # Diagnostyka: poziom dopasowania danego wzorca na aktualnym
+                # zrzucie ekranu (pomaga dobrać próg czułości).
+                _log(f"wzorzec '{name}': max_val={score:.3f} (środek {cx},{cy})")
                 if score > best_score:
                     best_score = score
                     best_center = (cx, cy)
+                    best_name = name
             if best_center is not None:
+                if self._stop_event.is_set():
+                    break  # zatrzymano w trakcie skanowania - bez tapu
                 cx, cy = best_center
+                _log(
+                    f"WYKRYTO reklamę '{best_name}' (max_val={best_score:.3f}) "
+                    f"-> tap ({cx}, {cy})"
+                )
                 if self._tap(cx, cy):
                     self.detected.emit(cx, cy)
                 # Przerwa po trafieniu - reklama potrzebuje czasu na zamknięcie.

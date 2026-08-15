@@ -70,6 +70,10 @@ class MainWindow(QMainWindow):
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
         self._ad_killer: AdKillerWorker | None = None
         self._ad_killer_dialog = None  # AdKillerConfigDialog (tworzony leniwie)
+        # Zatrzymane workery, które jeszcze kończą wątek w tle - trzymamy
+        # referencje, żeby QThread nie został zniszczony w trakcie działania
+        # (zapobiega nakładaniu się wielu instancji po wielokrotnym WŁ/WYŁ).
+        self._retired_ad_killers: list[AdKillerWorker] = []
 
         self._build_ui()
         self._wire_signals()
@@ -247,6 +251,10 @@ class MainWindow(QMainWindow):
             "🛡️ Auto-Zamykanie [WŁ]" if checked else "🛡️ Auto-Zamykanie [WYŁ]"
         )
         if checked:
+            if self._ad_killer is not None and self._ad_killer.isRunning():
+                # Zabezpieczenie przed nakładaniem się wątków skanowania.
+                self._status("🛡️ Ad Killer już działa - pomijam start.")
+                return
             threshold = 0.8
             interval_ms = 1500
             if self._ad_killer_dialog is not None:
@@ -270,8 +278,23 @@ class MainWindow(QMainWindow):
             self._ad_killer = None
             if worker is not None:
                 worker.stop()
-                worker.wait(3000)
+                # Nie blokujemy GUI (wait w tle): zatrzymany worker kończy
+                # wątek w tle (pętla czeka na event, nie na sleep), a my
+                # trzymamy referencję aż do sygnału finished.
+                self._retired_ad_killers.append(worker)
+                worker.finished.connect(
+                    lambda w=worker: self._on_ad_killer_retired(w)
+                )
+                if not worker.isRunning():
+                    # Wątek zdążył się już zakończyć - posprzątaj od razu.
+                    self._on_ad_killer_retired(worker)
             self._status("🛡️ Ad Killer wyłączony.")
+
+    def _on_ad_killer_retired(self, worker: AdKillerWorker) -> None:
+        """Sprząta po zatrzymanym workerze (wątek zakończył pracę)."""
+        if worker in self._retired_ad_killers:
+            self._retired_ad_killers.remove(worker)
+        worker.deleteLater()
 
     def _on_ad_killer_settings(self, threshold: float, interval_ms: int) -> None:
         """Aplikuje zmiany ustawień z okna konfiguracji do działającego workera."""
@@ -503,6 +526,8 @@ class MainWindow(QMainWindow):
             self._macro_runner.stop()
         if self._ad_killer is not None:
             self._ad_killer.stop()
+        for worker in list(self._retired_ad_killers):
+            worker.stop()
         self.keymapper_widget.stop()
         self.stream.stop_stream()
         super().closeEvent(event)
