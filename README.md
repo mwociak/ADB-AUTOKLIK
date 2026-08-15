@@ -34,6 +34,14 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
 ### Panel urządzeń
 - Połączenie **USB** lub **Wi-Fi** (ADB over TCP/IP), lista wykrytych urządzeń, przycisk odświeżania.
 - **Wskaźnik LED stanu ADB** – 🟢 ostatnia komenda OK, 🔴 błąd (np. odłączone urządzenie), ⚪ rozłączono.
+
+### Pasek nawigacji telefonu
+- Fizyczny pasek pod podglądem ekranu – działa niezależnie od tego, czy na telefonie włączono nawigację gestami:
+  - **◀ Wstecz** (keyevent 4), **◯ Home** (keyevent 3), **▢ Ostatnie** (keyevent 187),
+  - **🔒 Wygaszenie ekranu** (keyevent 223, KEYCODE_SLEEP),
+  - **🔓 Wybudzenie** (keyevent 224 + swipe w górę, aby minąć ekran blokady),
+  - `unlock_with_pin(pin)` – wybudzenie + swipe + wpisanie PIN-u + Enter (do odblokowania kodem),
+- Komendy wykonują się w osobnym wątku (nie blokują interfejsu), a wynik aktualizuje wskaźnik LED ADB (🟢 OK / 🔴 błąd).
 - **Multi-Device Control 🌐** – okno farmy urządzeń:
   - kafelki telefonów z numeracją, nazwą/IP i **podglądem zrzutu ekranu** (pobieranym przez ADB),
   - akcje zbiorcze: **uruchom aplikację po nazwie pakietu na wszystkich**, **sync tapu (X, Y) na wszystkich**, odświeżanie podglądów,
@@ -153,6 +161,7 @@ Skrypt `build.py` automatycznie:
 | `keymapper_widget.py` | Przełącznik keymappera + silnik nasłuchu klawiszy (pynput) |
 | `macro_runner.py` | Wątek odtwarzania makr z sygnałami postępu kroków |
 | `multi_device_window.py` | Farma urządzeń – kafelki telefonów i akcje zbiorcze |
+| `nav_bar_widget.py` | Pasek nawigacji telefonu – Wstecz/Home/Ostatnie + wygaszanie/wybudzanie ekranu |
 | `build.py` | Skrypt PyInstaller – budowa `dist/ADB-AUTOKLIK.exe` |
 | `requirements.txt` | Lista zależności |
 | `icon.ico` | Ikona aplikacji (używana przy budowie .exe) |

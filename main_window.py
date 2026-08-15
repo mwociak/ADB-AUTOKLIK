@@ -36,6 +36,7 @@ from config_manager import ConfigManager, MacroPoint, SwipePoint
 from device_panel import DevicePanel
 from keymapper_widget import KeymapperWidget
 from macro_runner import MacroRunner
+from nav_bar_widget import NavigationBar, NavigationWorker
 from stream_widget import AndroidScreenWidget
 
 _STATUS_TIMEOUT_MS = 6000
@@ -58,8 +59,10 @@ class MainWindow(QMainWindow):
         self.keymapper_widget = KeymapperWidget()
         self.stream = AndroidScreenWidget()
         self.stream.setMinimumWidth(480)
+        self.nav_bar = NavigationBar()
 
         self._macro_runner: MacroRunner | None = None
+        self._nav_worker: NavigationWorker | None = None
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
 
         self._build_ui()
@@ -102,9 +105,15 @@ class MainWindow(QMainWindow):
         topbar.addStretch(1)
         outer.addLayout(topbar)
 
+        # Kolumna streamu: podgląd telefonu + pasek nawigacji pod spodem
+        stream_col = QVBoxLayout()
+        stream_col.setSpacing(6)
+        stream_col.addWidget(self.stream, 1)
+        stream_col.addWidget(self.nav_bar)
+
         root = QHBoxLayout()
         root.setContentsMargins(8, 8, 8, 8)
-        root.addWidget(self.stream, 1)
+        root.addLayout(stream_col, 1)
         root.addWidget(scroll)
         outer.addLayout(root, 1)
         self.setCentralWidget(central)
@@ -150,6 +159,9 @@ class MainWindow(QMainWindow):
         st.stream_stopped.connect(self._on_stream_stopped)
         st.stream_error.connect(self._status)
 
+        # Pasek nawigacji telefonu (ADB keyevent - w tle, bez blokowania GUI)
+        self.nav_bar.action_triggered.connect(self._on_nav_action)
+
         # Multi-Device Control
         self.multi_device_button.clicked.connect(self._open_multi_device)
 
@@ -173,13 +185,34 @@ class MainWindow(QMainWindow):
 
     def _on_device_connected(self, serial: str) -> None:
         self.stream.start_stream(serial)
+        self.nav_bar.set_connected(True)
         self._status(f"Połączono: {serial}")
 
     def _on_stream_stopped(self, reason: str) -> None:
         if reason:
             # Urządzenie odłączone - LED wraca do stanu "rozłączono".
             self.device_panel.set_adb_status("off")
+            self.nav_bar.set_connected(False)
             self._status(reason)
+
+    # ------------------------------------------------------------------
+    # Pasek nawigacji (keyevent ADB w osobnym wątku)
+    # ------------------------------------------------------------------
+
+    def _on_nav_action(self, action: str) -> None:
+        """Wysyła komendę nawigacyjną w tle (nie blokuje interfejsu)."""
+        if self.adb.device_serial is None:
+            self._status("Połącz urządzenie, zanim użyjesz nawigacji.")
+            return
+        worker = NavigationWorker(self.adb, action)
+        worker.finished.connect(self._on_nav_finished)
+        self._nav_worker = worker
+        worker.start()
+
+    def _on_nav_finished(self, ok: bool, message: str) -> None:
+        """Wynik komendy z paska nawigacji -> LED ADB + komunikat."""
+        self.device_panel.set_adb_status("ok" if ok else "error")
+        self._status(message)
 
     # ------------------------------------------------------------------
     # Tryby edytora -> stream i keymapper

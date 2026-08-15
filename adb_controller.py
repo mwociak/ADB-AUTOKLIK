@@ -22,6 +22,15 @@ from adbutils.errors import AdbConnectionError
 # (gorąca ścieżka) chcemy szybkiego błędu zamiast czekania.
 SHELL_TIMEOUT = 2.0
 
+# Kody systemowych klawiszy Androida (``input keyevent``) - patrz
+# https://developer.android.com/reference/android/view/KeyEvent
+KEYCODE_BACK = 4
+KEYCODE_HOME = 3
+KEYCODE_APP_SWITCH = 187
+KEYCODE_SLEEP = 223
+KEYCODE_WAKEUP = 224
+KEYCODE_ENTER = 66
+
 
 class ADBError(Exception):
     """Błąd komunikacji z ADB z czytelnym (polskim) komunikatem dla użytkownika."""
@@ -183,6 +192,91 @@ class ADBController:
             print(
                 f"[ADBController] Nie udało się wysłać swipe "
                 f"({x1}, {y1}) -> ({x2}, {y2}) na {device.serial}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+    # ------------------------------------------------------------------
+    # Systemowe zdarzenia klawiszy (nawigacja) i kontrola ekranu
+    # ------------------------------------------------------------------
+
+    def send_keyevent(self, key_code: int) -> bool:
+        """Wysyła systemowy klawisz Android (``input keyevent``).
+
+        Przydatne np. dla paska nawigacji (Wstecz/Home/Ostatnie) - działa
+        niezależnie od tego, czy na telefonie włączono sterowanie gestami.
+        Zwraca ``True`` przy powodzeniu, ``False`` przy niepowodzeniu
+        (np. odłączone urządzenie) - analogicznie do :meth:`tap`.
+        """
+        device = self._require_device()
+        key_code = int(key_code)
+        try:
+            device.shell(
+                ["input", "keyevent", str(key_code)], timeout=SHELL_TIMEOUT
+            )
+            return True
+        except (adbutils.AdbError, OSError) as exc:
+            print(
+                f"[ADBController] Nie udało się wysłać keyevent {key_code} "
+                f"na {device.serial}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+    def press_back(self) -> bool:
+        """Wstecz (KEYCODE_BACK = 4)."""
+        return self.send_keyevent(KEYCODE_BACK)
+
+    def press_home(self) -> bool:
+        """Home (KEYCODE_HOME = 3)."""
+        return self.send_keyevent(KEYCODE_HOME)
+
+    def press_recents(self) -> bool:
+        """Przegląd ostatnich aplikacji (KEYCODE_APP_SWITCH = 187)."""
+        return self.send_keyevent(KEYCODE_APP_SWITCH)
+
+    def turn_off_screen(self) -> bool:
+        """Wygasza ekran telefonu (KEYCODE_SLEEP = 223)."""
+        return self.send_keyevent(KEYCODE_SLEEP)
+
+    def wake_up_screen(self) -> bool:
+        """Budzi ekran (KEYCODE_WAKEUP = 224) i przeciąga palcem w górę.
+
+        Swipe w górę (500, 1500 -> 500, 500) omija ekran blokady, więc
+        po wybudzeniu telefon jest od razu gotowy do interakcji.
+        Zwraca ``False``, gdy wybudzenie lub swipe się nie powiedzie.
+        """
+        if not self.send_keyevent(KEYCODE_WAKEUP):
+            return False
+        return self.swipe(500, 1500, 500, 500, duration_ms=150)
+
+    def unlock_with_pin(self, pin: str) -> bool:
+        """Budzi ekran i odblokowuje PIN-em: swipe w górę + ``input text`` + Enter.
+
+        Sekwencja: wakeup -> swipe w górę (ekran blokady) -> wpisanie PIN-u
+        (``input text``) -> potwierdzenie klawiszem Enter (keyevent 66).
+        Pusty PIN nie jest wysyłany (zwraca ``False``).
+        """
+        pin = (pin or "").strip()
+        if not pin:
+            print(
+                "[ADBController] Pusty PIN - pomijam odblokowanie.",
+                file=sys.stderr,
+            )
+            return False
+        if not self.wake_up_screen():
+            return False
+        device = self._require_device()
+        try:
+            device.shell(["input", "text", pin], timeout=SHELL_TIMEOUT)
+            device.shell(
+                ["input", "keyevent", str(KEYCODE_ENTER)], timeout=SHELL_TIMEOUT
+            )
+            return True
+        except (adbutils.AdbError, OSError) as exc:
+            print(
+                f"[ADBController] Nie udało się odblokować PIN-em "
+                f"na {device.serial}: {exc}",
                 file=sys.stderr,
             )
             return False
