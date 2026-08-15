@@ -24,6 +24,11 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
 - **Nakładka (overlay)** – wszystkie akcje widoczne na obrazie telefonu: kółka z literami klawiszy, strzałki swipe'ów, kroki makr.
 - **Przeciąganie punktów** – złap dowolne kółko/strzałkę i przeciągnij w nowe miejsce; zmiana zapisuje się od razu do `keymap.json`.
 
+### Sterowanie telefonem na żywo (🎮 Sterowanie / ➕ Mapowanie)
+- Górny pasek przełącza tryb podglądu: **🎮 Sterowanie** – klik = **tap**, przeciągnięcie = **swipe** wysyłane do telefonu przez ADB (możesz nawigować po aplikacjach bez dotykania ekranu) oraz **➕ Mapowanie** – kliknięcia/gesty definiują akcje keymapy.
+- Rozpoczęcie dodawania akcji/makra **automatycznie przełącza** na Mapowanie, a zapis wraca do Sterowania.
+- Gest sterowania wykonuje się w osobnym wątku (nie blokuje interfejsu), a wynik aktualizuje wskaźnik LED ADB.
+
 ### Edycja makr
 - Wybierz makro z tabeli, kliknij krok na liście → tryb edycji kroku z podświetleniem na nakładce.
 - **Zastąp pozycję** – kliknij/przeciągnij na ekranie, aby ustawić nowe współrzędne kroku.
@@ -47,6 +52,14 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
   - akcje zbiorcze: **uruchom aplikację po nazwie pakietu na wszystkich**, **sync tapu (X, Y) na wszystkich**, odświeżanie podglądów,
   - odłączanie urządzeń z siatki.
 
+### Ad Killer 🛡️ (automatyczne zamykanie reklam)
+- Skanuje klatki streamu w **osobnym wątku** i szuka wzorców reklam (np. krzyżyków „X") metodą **OpenCV Template Matching** (`cv2.matchTemplate`, grayscale, multi-skala – wzorce bywają różnej wielkości).
+- Wzorce to obrazy PNG w katalogu **`ad_templates/`**; gdy dopasowanie przekroczy próg czułości (domyślnie **80%**), aplikacja wysyła tap na środek wzorca i wstrzymuje skanowanie na 3 s.
+- **🛡️ Auto-Zamykanie [WŁ/WYŁ]** na pasku głównym startuje/zatrzymuje skanowanie.
+- **🛡️ Ad Killer Config** – okno konfiguracji: podgląd wzorców (miniatury), suwak czułości, interwał skanowania (ms) oraz dwa sposoby dodawania wzorców:
+  - **z ekranu** – zaznaczysz prostokąt na podglądzie telefonu (z ostatniej klatki streamu),
+  - **z pliku (Offline)** – wytnij wzorzec ze statycznego zrzutu ekranu (PNG/JPG) **bez podłączonego urządzenia**; okno wycina zaznaczony prostokąt (przelicza skalę na oryginalne wymiary) i zapisuje go jako `template_N.png`.
+
 ### Zapisywanie i kompatybilność
 - Wszystkie akcje trzymane w **`keymap.json`** (prosty JSON – możesz edytować ręcznie).
 - Stare pliki z formatu tap/swipe wczytują się bez zmian (kompatybilność wsteczna).
@@ -63,6 +76,7 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
 | **adbutils** | komunikacja z ADB (`input tap/swipe`, `screencap`, połączenia) |
 | **scrcpy-client** | strumieniowanie ekranu telefonu (H.264) |
 | **av + numpy** | dekodowanie i przetwarzanie klatek wideo |
+| **opencv-python** | wykrywanie wzorców reklam – Ad Killer (Template Matching) |
 | **PyInstaller** | budowanie samodzielnego `.exe` (skrypt `build.py`) |
 
 ---
@@ -120,10 +134,17 @@ W oknie aplikacji:
    - *Makro*: nagrywaj kroki z ekranu (klik = Tap, przeciągnięcie = Swipe) i dodawaj pauzy (Delay) spinboxem.
 4. Wpisz (lub wciśnij) **klawisz**, podaj **nazwę**, kliknij **„Zapisz akcję"**.
 5. Włącz przełącznik **„Keymapper Aktywny"** – od teraz wciśnięcie przypisanego klawisza wykonuje akcję na telefonie.
+6. **Sterowanie telefonem** – w trybie **🎮 Sterowanie** kliknięcia i gesty myszy na podglądzie są wysyłane do telefonu (nawiguj po aplikacjach bez dotykania ekranu); przełącz na **➕ Mapowanie**, aby zamiast tego definiować akcje.
 
 ### Multi-Device Control
 
 Kliknij **🌐 Multi-Device Control** w górnym pasku głównego okna. W oknie farmy urządzeń dodawaj telefony z listy ADB lub ręcznie po `IP:port`, a następnie używaj akcji zbiorczych (uruchomienie aplikacji / sync tapu na wszystkich urządzeniach).
+
+### Ad Killer
+
+1. Otwórz **🛡️ Ad Killer Config** i dodaj wzorce reklam (z ekranu albo z pliku offline) albo wrzuć własne PNG do katalogu `ad_templates/`.
+2. Zaznacz **🛡️ Auto-Zamykanie [WŁ]** – aplikacja sama wykryje krzyżyki reklam na streamie i zamknie je tapem.
+3. Czujność dopasowania i częstotliwość skanowania regulujesz w oknie konfiguracji (próg, interwał w ms).
 
 ---
 
@@ -140,7 +161,8 @@ Skrypt `build.py` automatycznie:
 
 - dołącza **`scrcpy-server.jar`** do bundla w miejscu `sys._MEIPASS/scrcpy/`, którego oczekuje biblioteka (bez tego stream wywala „Failed to connect scrcpy-server after 3 seconds"),
 - ustawia **ikonę aplikacji** z pliku `icon.ico` (znajduje się w repozytorium),
-- zbiera binaria/kodeki **PyAV** (`--collect-all av`),
+- zbiera binaria/kodeki **PyAV** (`--collect-all av`) i **OpenCV** (`--collect-all cv2` – .pyd/.dll ładowane dynamicznie, wymagane przez Ad Killer),
+- dołącza katalog **`ad_templates/`** ze wzorcami reklam (wzorce dodane przez użytkownika lądują obok pliku .exe i nie znikają po restarcie),
 - dopina ukryte importy **pynput** dla Windows (`pynput.keyboard._win32`, `pynput.mouse._win32`) – bez nich keymapper milczy w spakowanej wersji.
 
 > 💡 Ikona jest używana tylko jeśli plik `icon.ico` leży obok `build.py` – gdy go brakuje, build przechodzi bez ikony (z ostrzeżeniem).
@@ -155,11 +177,14 @@ Skrypt `build.py` automatycznie:
 | `main_window.py` | Okno główne – kompozycja paneli i łączenie sygnałów Qt |
 | `adb_controller.py` | Komunikacja z ADB – `tap`, `swipe`, rozdzielczość, urządzenia |
 | `config_manager.py` | Profil akcji – Tap/Swipe/Makro, zapis/odczyt `keymap.json` |
-| `stream_widget.py` | Podgląd ekranu (scrcpy) z nakładką, gestami i drag & drop |
+| `stream_widget.py` | Podgląd ekranu (scrcpy) z nakładką, gestami, drag & drop i interaktywnym sterowaniem (tap/swipe) |
 | `device_panel.py` | Panel połączeń – lista urządzeń, USB/Wi-Fi, wskaźnik LED ADB |
 | `action_editor.py` | Formularz akcji – Tap/Swipe/Makro, edytor i podgląd kroków |
 | `keymapper_widget.py` | Przełącznik keymappera + silnik nasłuchu klawiszy (pynput) |
 | `macro_runner.py` | Wątek odtwarzania makr z sygnałami postępu kroków |
+| `ad_killer_module.py` | Moduł Ad Killer – worker QThread z Template Matching (OpenCV) |
+| `ad_killer_ui.py` | Okno konfiguracji Ad Killer – wzorce, czułość, interwał + wycinanie wzorca z pliku (OfflineCropDialog) |
+| `ad_templates/` | Wzorce reklam (PNG) dla Ad Killer |
 | `multi_device_window.py` | Farma urządzeń – kafelki telefonów i akcje zbiorcze |
 | `nav_bar_widget.py` | Pasek nawigacji telefonu – Wstecz/Home/Ostatnie + wygaszanie/wybudzanie ekranu |
 | `build.py` | Skrypt PyInstaller – budowa `dist/ADB-AUTOKLIK.exe` |

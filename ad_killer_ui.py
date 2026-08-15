@@ -19,19 +19,156 @@ from __future__ import annotations
 import os
 
 import cv2
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
+
+from ad_killer_module import default_templates_dir
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
+    QRubberBand,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QVBoxLayout,
 )
+
+
+class _CropLabel(QLabel):
+    """QLabel z rysowaniem przerywanego prostokąta (QRubberBand).
+
+    Emituje ``rect_selected(QRect)`` po puszczeniu LPM (współrzędne
+    labela, czyli skalowanego obrazu; prostokąt >= 8 px).
+    """
+
+    rect_selected = pyqtSignal(QRect)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._origin: QPoint | None = None
+        self._rubber = QRubberBand(QRubberBand.Shape.Rectangle, self)
+        self._rubber.setStyleSheet(
+            "QRubberBand { border: 2px dashed #4fd1ff; "
+            "background-color: rgba(79, 209, 255, 35); }"
+        )
+        self.setMouseTracking(True)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._origin = event.position().toPoint()
+            self._rubber.setGeometry(QRect(self._origin, QSize()))
+            self._rubber.show()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if self._origin is not None:
+            self._rubber.setGeometry(
+                QRect(self._origin, event.position().toPoint()).normalized()
+            )
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
+        if event.button() == Qt.MouseButton.LeftButton and self._origin is not None:
+            rect = QRect(self._origin, event.position().toPoint()).normalized()
+            self._origin = None
+            self._rubber.hide()
+            if rect.width() >= 8 and rect.height() >= 8:
+                self.rect_selected.emit(rect)
+        super().mouseReleaseEvent(event)
+
+
+class OfflineCropDialog(QDialog):
+    """Wycinanie wzorca ze statycznego obrazu (tryb offline, bez streamu).
+
+    Wyświetla obraz skalowany z zachowaniem proporcji (max. 1200×800 px),
+    pozwala zaznaczyć prostokąt myszką (QRubberBand) i po puszczeniu LPM
+    przelicza współrzędne na oryginalne wymiary obrazu, wycina fragment
+    i zapisuje jako ``template_N.png`` (pierwsza wolna nazwa) do
+    ``ad_templates/``. Po zapisie emituje ``template_saved(str)``
+    i zamyka okno.
+    """
+
+    MAX_DISPLAY = QSize(1200, 800)
+
+    template_saved = pyqtSignal(str)  # ścieżka zapisanego wzorca
+
+    def __init__(
+        self,
+        image_path: str,
+        templates_dir: str = "ad_templates",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._templates_dir = templates_dir
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            raise ValueError(f"Nie można wczytać obrazu: {image_path}")
+        self._pixmap = pixmap
+        self.setWindowTitle(f"Wytnij wzorzec - {os.path.basename(image_path)}")
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        scaled = self._pixmap.scaled(
+            self.MAX_DISPLAY,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        # Skala wyświetlania (label) -> oryginalne wymiary obrazu.
+        self._scale = scaled.width() / self._pixmap.width()
+
+        self._label = _CropLabel()
+        self._label.setPixmap(scaled)
+        self._label.setFixedSize(scaled.size())
+        self._label.rect_selected.connect(self._on_rect_selected)
+
+        scroll = QScrollArea()
+        scroll.setWidget(self._label)
+        scroll.setWidgetResizable(False)
+        scroll.setFixedSize(
+            QSize(
+                min(self.MAX_DISPLAY.width(), scaled.width()),
+                min(self.MAX_DISPLAY.height(), scaled.height()),
+            )
+        )
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(scroll)
+        hint = QLabel(
+            f"Zaznacz prostokąt wokół wzorca (obraz: "
+            f"{self._pixmap.width()} × {self._pixmap.height()} px).\n"
+            "Po puszczeniu myszy fragment zostanie zapisany do "
+            f"{self._templates_dir}/."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def _on_rect_selected(self, rect: QRect) -> None:
+        """Wycina zaznaczony fragment i zapisuje jako nowy wzorzec PNG."""
+        ox = int(round(rect.x() / self._scale))
+        oy = int(round(rect.y() / self._scale))
+        ow = min(int(round(rect.width() / self._scale)), self._pixmap.width() - ox)
+        oh = min(int(round(rect.height() / self._scale)), self._pixmap.height() - oy)
+        if ow < 1 or oh < 1:
+            return
+        crop = self._pixmap.copy(ox, oy, ow, oh)
+        os.makedirs(self._templates_dir, exist_ok=True)
+        existing = {
+            f for f in os.listdir(self._templates_dir)
+            if f.lower().endswith(".png")
+        }
+        n = 1
+        while f"template_{n}.png" in existing:
+            n += 1
+        path = os.path.join(self._templates_dir, f"template_{n}.png")
+        if crop.save(path, "PNG"):
+            self.template_saved.emit(path)
+            self.accept()
 
 
 class AdKillerConfigDialog(QDialog):
@@ -43,14 +180,14 @@ class AdKillerConfigDialog(QDialog):
     def __init__(
         self,
         stream: "AndroidScreenWidget",
-        templates_dir: str = "ad_templates",
+        templates_dir: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("🛡️ Ad Killer - konfiguracja")
         self.setMinimumWidth(360)
         self._stream = stream
-        self._templates_dir = templates_dir
+        self._templates_dir = templates_dir or default_templates_dir()
         self._build_ui()
         self._load_templates()
         self._stream.rect_selected.connect(self._on_rect_selected)
@@ -97,6 +234,12 @@ class AdKillerConfigDialog(QDialog):
         )
         layout.addWidget(self.add_button)
 
+        self.file_button = QPushButton("🖼️ Dodaj wzorzec z pliku (Offline)")
+        self.file_button.setToolTip(
+            "Wytnij wzorzec ze statycznego zrzutu ekranu (bez streamu i urządzenia)"
+        )
+        layout.addWidget(self.file_button)
+
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -104,6 +247,7 @@ class AdKillerConfigDialog(QDialog):
         self.threshold_slider.valueChanged.connect(self._on_settings_changed)
         self.interval_spin.valueChanged.connect(self._on_settings_changed)
         self.add_button.clicked.connect(self._on_add_template)
+        self.file_button.clicked.connect(self._on_add_from_file)
 
     # ------------------------------------------------------------------
     # Ustawienia
@@ -209,6 +353,35 @@ class AdKillerConfigDialog(QDialog):
         self.status_label.setText(
             f"Zapisano wzorzec: {os.path.basename(path)}"
         )
+
+    # ------------------------------------------------------------------
+    # Dodawanie wzorca z pliku (tryb offline)
+    # ------------------------------------------------------------------
+
+    def _on_add_from_file(self) -> None:
+        """Wybierz obraz (PNG/JPG) i otwórz okno wycinania wzorca."""
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Wybierz obraz ze wzorcem reklamy",
+            "",
+            "Obrazy (*.png *.jpg *.jpeg);;Wszystkie pliki (*)",
+        )
+        if not path:
+            return
+        try:
+            dialog = OfflineCropDialog(path, self._templates_dir, parent=self)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Błąd", str(exc))
+            return
+        dialog.template_saved.connect(self._on_template_saved)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_template_saved(self, _path: str) -> None:
+        """Wzorzec zapisany offline - odśwież listę i powiadom workera."""
+        self._load_templates()
+        self.templates_changed.emit()
 
     # ------------------------------------------------------------------
     # Zamknięcie

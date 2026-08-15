@@ -19,10 +19,12 @@ scrcpy-server.jar``. Skrypt znajduje jar w zainstalowanym pakiecie
 ``scrcpy`` (site-packages) i przekazuje go PyInstallerowi.
 
 Dodatkowo skrypt dopina ``--collect-all av`` (binaria/kodeki PyAV, które
-PyInstaller nie wykrywa w pełni automatycznie) oraz jawne hidden-importy
-dla ``pynput`` na Windows (moduły platformowe ładowane dynamicznie).
-Plik ``icon.ico`` z repozytorium jest przekazywany przez ``--icon`` jako
-ikona .exe i okna aplikacji.
+PyInstaller nie wykrywa w pełni automatycznie), ``--collect-all cv2``
+(OpenCV - pliki .pyd/.dll ładowane dynamicznie, wymagane przez moduł
+Ad Killer) oraz dołącza katalog ``ad_templates/`` (wzorce reklam).
+Dopięte są też jawne hidden-importy dla ``pynput`` na Windows (moduły
+platformowe ładowane dynamicznie). Plik ``icon.ico`` z repozytorium jest
+przekazywany przez ``--icon`` jako ikona .exe i okna aplikacji.
 """
 
 from __future__ import annotations
@@ -64,10 +66,15 @@ def main() -> int:
     else:
         print("[build] UWAGA: brak pliku icon.ico obok build.py - buduję bez ikony")
 
-    # Separator --add-data zależy od platformy (Windows: ';', POSIX: ':'),
-    # dlatego używamy os.pathsep. Cel "scrcpy" = _MEIPASS/scrcpy/ w bundlu.
-    add_data = f"{jar}{os.pathsep}scrcpy"
+    templates_dir = PROJECT_ROOT / "ad_templates"
+    if templates_dir.is_dir():
+        print(f"[build] wzorce ad_templates/: {templates_dir}")
+    else:
+        print("[build] UWAGA: brak katalogu ad_templates/ - buduję bez wzorców reklam")
 
+    # Separator --add-data zależy od platformy (Windows: ';', POSIX: ':'),
+    # dlatego używamy os.pathsep. Cel "scrcpy" = _MEIPASS/scrcpy/ w bundlu,
+    # a "ad_templates" - dołączone wzorce startowe reklam.
     cmd = [
         sys.executable,
         "-m",
@@ -78,14 +85,23 @@ def main() -> int:
         "--name",
         APP_NAME,
         "--add-data",
-        add_data,
+        f"{jar}{os.pathsep}scrcpy",
+    ]
+    if templates_dir.is_dir():
+        cmd += [
+            "--add-data",
+            f"{templates_dir}{os.pathsep}ad_templates",
+        ]
+    cmd += [
         # Ikona aplikacji (icon.ico) - ustawia ikonę pliku .exe i okna.
-        # Pominięta tylko, gdy pliku brakuje (build nie powinien padać).
         "--icon",
         str(ICON_FILE),
         # PyAV: podmoduły, pliki danych i binaria (nie wykrywane w pełni automatycznie)
         "--collect-all",
         "av",
+        # OpenCV: pliki .pyd/.dll ładowane dynamicznie (Ad Killer - Template Matching)
+        "--collect-all",
+        "cv2",
         "--hidden-import",
         "adbutils",
     ]

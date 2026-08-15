@@ -36,6 +36,21 @@ from PyQt6.QtCore import QThread, pyqtSignal
 DEFAULT_SCALES = (0.6, 0.8, 1.0, 1.25, 1.5)
 
 
+def default_templates_dir() -> str:
+    """Zwraca domyślny katalog wzorców Ad Killer (``ad_templates/``).
+
+    W wersji spakowanej PyInstallerem (``getattr(sys, "frozen", False)``)
+    katalog leży obok pliku wykonywalnego - wzorce dodane przez użytkownika
+    nie znikają po restarcie (a wbudowane, dołączone do .exe, służą jako
+    startowe). W trybie źródłowym - w bieżącym katalogu roboczym.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.getcwd()
+    return os.path.join(base, "ad_templates")
+
+
 def find_best_match(
     frame: np.ndarray, template: np.ndarray, scales: tuple[float, ...] = DEFAULT_SCALES
 ) -> tuple[float, int, int] | None:
@@ -76,7 +91,7 @@ class AdKillerWorker(QThread):
         self,
         adb: "ADBController",
         stream: "AndroidScreenWidget",
-        templates_dir: str = "ad_templates",
+        templates_dir: str | None = None,
         threshold: float = 0.8,
         interval_ms: int = 1500,
         cooldown_s: float = 3.0,
@@ -85,7 +100,7 @@ class AdKillerWorker(QThread):
         super().__init__(parent)
         self._adb = adb
         self._stream = stream
-        self._templates_dir = templates_dir
+        self._templates_dir = templates_dir or default_templates_dir()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._threshold = float(threshold)
