@@ -8,6 +8,10 @@ gestami - wysyła systemowe klawisze przez ADB (``input keyevent``):
     ▢ Ostatnie    - keyevent 187 (KEYCODE_APP_SWITCH)
     🔒 Wygaszenie - keyevent 223 (KEYCODE_SLEEP)
     🔓 Wybudzenie - keyevent 224 (KEYCODE_WAKEUP) + swipe w górę
+    🔄 Poziom     - wymusza tryb poziomy (settings: accelerometer_rotation=0,
+                   user_rotation=1) - np. dla gier widocznych błędnie w pionie
+    ↕️ Pion (Auto) - powrót do pionu / auto-rotacji (accelerometer_rotation=1,
+                   user_rotation=0)
 
 Kliknięcia nie blokują pętli zdarzeń PyQt6: :class:`NavigationBar` emituje
 ``action_triggered(str)``, a wykonanie komendy ADB odbywa się w osobnym
@@ -39,6 +43,14 @@ _NAV_ACTIONS: dict[str, tuple[str, str]] = {
     "recents": ("▢ Ostatnie", "Przegląd ostatnich aplikacji (keyevent 187)"),
     "screen_off": ("🔒 Wygaszenie", "Wyłącza ekran telefonu (keyevent 223)"),
     "screen_on": ("🔓 Wybudzenie", "Budzi ekran i omija blokadę (keyevent 224 + swipe)"),
+    "rotate_landscape": (
+        "🔄 Poziom",
+        "Wymusza tryb poziomy (landscape): auto-rotacja OFF, user_rotation=1",
+    ),
+    "rotate_portrait": (
+        "↕️ Pion (Auto)",
+        "Powrót do pionu / auto-rotacji: accelerometer_rotation=1, user_rotation=0",
+    ),
 }
 
 
@@ -71,6 +83,10 @@ class NavigationWorker(QObject, threading.Thread):
                 ok = self._adb.turn_off_screen()
             elif action == "screen_on":
                 ok = self._adb.wake_up_screen()
+            elif action == "rotate_landscape":
+                ok = self._adb.force_landscape()
+            elif action == "rotate_portrait":
+                ok = self._adb.enable_auto_rotate()
             else:
                 ok = False
         except Exception as exc:  # noqa: BLE001 - komenda nie może wywalać wątku

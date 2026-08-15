@@ -281,6 +281,81 @@ class ADBController:
             )
             return False
 
+    # ------------------------------------------------------------------
+    # Orientacja ekranu (obrót / wymuszenie trybu poziomego)
+    # ------------------------------------------------------------------
+
+    def set_orientation(self, rotation: int) -> bool:
+        """Wymusza orientację ekranu urządzenia (0-3) i wyłącza auto-rotację.
+
+        Wyłącza automatyczną rotację (``accelerometer_rotation = 0``)
+        i ustawia sztywny obrót ``user_rotation``:
+            0 - pion (portrait),
+            1 - poziom (landscape, 90°),
+            2 - pion odwrócony (180°),
+            3 - poziom odwrócony (270°).
+
+        Zwraca ``True`` przy powodzeniu, ``False`` przy błędzie
+        (np. odłączone urządzenie) - analogicznie do :meth:`tap`.
+        """
+        device = self._require_device()
+        rotation = int(rotation) % 4
+        try:
+            device.shell(
+                ["settings", "put", "system", "accelerometer_rotation", "0"],
+                timeout=SHELL_TIMEOUT,
+            )
+            device.shell(
+                ["settings", "put", "system", "user_rotation", str(rotation)],
+                timeout=SHELL_TIMEOUT,
+            )
+            return True
+        except (adbutils.AdbError, OSError) as exc:
+            print(
+                f"[ADBController] Nie udało się ustawić orientacji {rotation} "
+                f"na {device.serial}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
+    def force_landscape(self) -> bool:
+        """Wymusza tryb poziomy (landscape): auto-rotacja OFF + ``user_rotation 1``.
+
+        Przydatne np. dla gier, które wyświetlają się poprawnie tylko
+        w poziomie (gdy preview streamu pokazuje je błędnie w pionie).
+        """
+        return self.set_orientation(1)
+
+    def force_portrait(self) -> bool:
+        """Wymusza tryb pionowy (portrait): auto-rotacja OFF + ``user_rotation 0``."""
+        return self.set_orientation(0)
+
+    def enable_auto_rotate(self) -> bool:
+        """Przywraca automatyczną rotację ekranu (powrót do pionu).
+
+        Włącza ``accelerometer_rotation = 1`` i resetuje ``user_rotation 0``
+        - ekran znów obraca się razem z telefonem, a domyślna orientacja
+        to pion. Zwraca ``True`` przy powodzeniu, ``False`` przy błędzie.
+        """
+        device = self._require_device()
+        try:
+            device.shell(
+                ["settings", "put", "system", "accelerometer_rotation", "1"],
+                timeout=SHELL_TIMEOUT,
+            )
+            device.shell(
+                ["settings", "put", "system", "user_rotation", "0"],
+                timeout=SHELL_TIMEOUT,
+            )
+            return True
+        except (adbutils.AdbError, OSError) as exc:
+            print(
+                f"[ADBController] Nie udało się włączyć auto-rotacji "
+                f"na {device.serial}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+
     def get_screen_size(self) -> tuple[int, int] | None:
         """Zwraca rozdzielczość ekranu telefonu jako krotkę (width, height).
 
