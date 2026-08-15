@@ -21,9 +21,13 @@ Wymagane zależności: PyQt6, scrcpy-client (z git main -
 from __future__ import annotations
 
 import math
+import os
+import shutil
+import sys
 import threading
 
 import numpy as np
+import scrcpy
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QWidget
@@ -53,6 +57,66 @@ _SWIPE_END_RADIUS = 5.0
 _SWIPE_MIN_DRAG_PX = 10
 # Promień trafienia [px] przy chwytaniu punktu nakładki (drag & drop).
 _DRAG_HIT_RADIUS = 26.0
+# Nazwa pliku serwera scrcpy (jar), wgrywanego na telefon przez ADB.
+_SCRCPY_SERVER_FILE = "scrcpy-server.jar"
+
+
+def resolve_scrcpy_server() -> str:
+    """Zwraca ścieżkę do pliku ``scrcpy-server.jar`` (serwer scrcpy).
+
+    W wersji spakowanej PyInstallerem (``getattr(sys, "frozen", False)``)
+    pliki aplikacji są rozpakowywane do tymczasowego katalogu
+    ``sys._MEIPASS``, a dołączony przez ``--add-data`` plik ląduje tam
+    w zależności od celu: ``scrcpy`` (cel używany przez ``build.py``)
+    daje ``sys._MEIPASS/scrcpy/scrcpy-server.jar``. Funkcja sprawdza
+    kolejno najbardziej prawdopodobne lokalizacje (cel ``scrcpy``, cel
+    płaski ``.``, katalog obok pliku wykonywalnego) i zwraca pierwszą
+    istniejącą; gdy żadna nie istnieje - zwraca ścieżkę najbardziej
+    oczekiwaną (do czytelnego komunikatu błędu).
+
+    W trybie źródłowym plik leży obok modułu ``scrcpy`` w site-packages.
+    """
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates = (
+            os.path.join(base, "scrcpy", _SCRCPY_SERVER_FILE),
+            os.path.join(base, _SCRCPY_SERVER_FILE),
+            os.path.join(exe_dir, _SCRCPY_SERVER_FILE),
+        )
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return candidates[0]
+    return os.path.join(os.path.dirname(scrcpy.__file__), _SCRCPY_SERVER_FILE)
+
+
+def ensure_scrcpy_server() -> str | None:
+    """Gwarantuje, że ``scrcpy-server.jar`` jest w miejscu, którego szuka biblioteka.
+
+    ``scrcpy.Client`` twardo zakodował ścieżkę serwera jako
+    ``os.path.dirname(scrcpy.__file__) + "/scrcpy-server.jar"`` (nie ma
+    parametru ze ścieżką). Dlatego przed utworzeniem klienta kopiujemy
+    nasz plik - znaleziony przez :func:`resolve_scrcpy_server` - pod
+    dokładnie to oczekiwane miejsce (``sys._MEIPASS`` jest zapisywalny).
+
+    Zwraca ścieżkę gotowego pliku albo ``None``, gdy serwera nie można
+    znaleźć nigdzie (brak bundla / brak site-packages).
+    """
+    expected = os.path.join(os.path.dirname(scrcpy.__file__), _SCRCPY_SERVER_FILE)
+    if os.path.isfile(expected):
+        return expected
+    source = resolve_scrcpy_server()
+    if not os.path.isfile(source):
+        return None
+    try:
+        os.makedirs(os.path.dirname(expected), exist_ok=True)
+        shutil.copy2(source, expected)
+        return expected
+    except OSError:
+        # Katalog pakietu może być tylko do odczytu - oddajemy znalezioną
+        # ścieżkę (działa dla układu ``--add-data ...;.`` w trybie onedir).
+        return source
 
 
 class AndroidScreenWidget(QWidget):
@@ -177,6 +241,14 @@ class AndroidScreenWidget(QWidget):
 
     def _run_client(self, serial: str) -> None:
         """Uruchamia klienta scrcpy (wątek roboczy; klatki lecą w osobnym wątku)."""
+        server_path = ensure_scrcpy_server()
+        if server_path is None:
+            self.stream_error.emit(
+                "Nie znaleziono pliku scrcpy-server.jar (wymaganego przez scrcpy). "
+                "Spakuj aplikację przez `python build.py` albo dołącz plik "
+                "scrcpy-server.jar obok pliku wykonywalnego."
+            )
+            return
         try:
             client = Client(
                 device=serial,
