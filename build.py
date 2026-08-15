@@ -21,6 +21,8 @@ scrcpy-server.jar``. Skrypt znajduje jar w zainstalowanym pakiecie
 Dodatkowo skrypt dopina ``--collect-all av`` (binaria/kodeki PyAV, które
 PyInstaller nie wykrywa w pełni automatycznie) oraz jawne hidden-importy
 dla ``pynput`` na Windows (moduły platformowe ładowane dynamicznie).
+Plik ``icon.ico`` z repozytorium jest przekazywany przez ``--icon`` jako
+ikona .exe i okna aplikacji.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 APP_NAME = "ADB-AUTOKLIK"
 SERVER_FILE = "scrcpy-server.jar"
+ICON_FILE = PROJECT_ROOT / "icon.ico"  # ikona aplikacji (w repo)
 
 
 def find_scrcpy_server() -> Path | None:
@@ -56,6 +59,11 @@ def main() -> int:
         return 1
     print(f"[build] scrcpy-server.jar: {jar}")
 
+    if ICON_FILE.is_file():
+        print(f"[build] ikona: {ICON_FILE}")
+    else:
+        print("[build] UWAGA: brak pliku icon.ico obok build.py - buduję bez ikony")
+
     # Separator --add-data zależy od platformy (Windows: ';', POSIX: ':'),
     # dlatego używamy os.pathsep. Cel "scrcpy" = _MEIPASS/scrcpy/ w bundlu.
     add_data = f"{jar}{os.pathsep}scrcpy"
@@ -71,6 +79,10 @@ def main() -> int:
         APP_NAME,
         "--add-data",
         add_data,
+        # Ikona aplikacji (icon.ico) - ustawia ikonę pliku .exe i okna.
+        # Pominięta tylko, gdy pliku brakuje (build nie powinien padać).
+        "--icon",
+        str(ICON_FILE),
         # PyAV: podmoduły, pliki danych i binaria (nie wykrywane w pełni automatycznie)
         "--collect-all",
         "av",
