@@ -24,6 +24,13 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
 - **Nakładka (overlay)** – wszystkie akcje widoczne na obrazie telefonu: kółka z literami klawiszy, strzałki swipe'ów, kroki makr.
 - **Przeciąganie punktów** – złap dowolne kółko/strzałkę i przeciągnij w nowe miejsce; zmiana zapisuje się od razu do `keymap.json`.
 
+### 🔁 Tryb Powtarzanie (pętla akcji)
+- Przełącznik **🔁 Powtarzanie [WYŁ/WŁ]** na górnym pasku uruchamia pętlę dla **ostatniej wybranej akcji** – aż do wyłączenia:
+  - **Makro** – po zakończeniu odtwarzania automatycznie zaczyna się od początku (w kółko),
+  - **Tap** – wciśnięcie przypisanego klawisza zaczyna powtarzać tapnięcia co ustawioną zwłokę (tap → zwłoka → tap → …).
+- Pętla działa w **osobnym wątku** (nie blokuje GUI ani keymappera); wybranie nowej akcji przejmuje pętlę (tap zatrzymuje makro i odwrotnie), a wyłączenie przełącznika zatrzymuje wszystko natychmiast.
+- **Zwłoka powtórzenia per punkt**: zaznacz tap w tabeli akcji → pojawi się pole **🔁 Zwłoka powtórzenia** (0–60 000 ms, „Zastosuj"). Wartość zapisywana jest w `keymap.json` jako `repeat_delay_ms`; 0 oznacza domyślną zwłokę programu (500 ms).
+
 ### Sterowanie telefonem na żywo (🎮 Sterowanie / ➕ Mapowanie)
 - Górny pasek przełącza tryb podglądu: **🎮 Sterowanie** – klik = **tap**, przeciągnięcie = **swipe** wysyłane do telefonu przez ADB (możesz nawigować po aplikacjach bez dotykania ekranu) oraz **➕ Mapowanie** – kliknięcia/gesty definiują akcje keymapy.
 - Rozpoczęcie dodawania akcji/makra **automatycznie przełącza** na Mapowanie, a zapis wraca do Sterowania.
@@ -136,6 +143,7 @@ W oknie aplikacji:
 4. Wpisz (lub wciśnij) **klawisz**, podaj **nazwę**, kliknij **„Zapisz akcję"**.
 5. Włącz przełącznik **„Keymapper Aktywny"** – od teraz wciśnięcie przypisanego klawisza wykonuje akcję na telefonie.
 6. **Sterowanie telefonem** – w trybie **🎮 Sterowanie** kliknięcia i gesty myszy na podglądzie są wysyłane do telefonu (nawiguj po aplikacjach bez dotykania ekranu); przełącz na **➕ Mapowanie**, aby zamiast tego definiować akcje.
+7. **Powtarzanie akcji** – zaznacz **🔁 Powtarzanie [WŁ]** i wciśnij klawisz tapu albo makra: akcja wykonuje się w pętli aż do wyłączenia przełącznika. Zwłokę między kolejnymi tapnięciami ustawisz po zaznaczeniu tapu w tabeli akcji (pole „🔁 Zwłoka powtórzenia").
 
 ### Multi-Device Control
 
@@ -178,12 +186,12 @@ Skrypt `build.py` automatycznie:
 | `main.py` | Punkt wejścia – ciemny motyw i uruchomienie okna głównego |
 | `main_window.py` | Okno główne – kompozycja paneli i łączenie sygnałów Qt |
 | `adb_controller.py` | Komunikacja z ADB – `tap`, `swipe`, rozdzielczość, urządzenia |
-| `config_manager.py` | Profil akcji – Tap/Swipe/Makro, zapis/odczyt `keymap.json` |
+| `config_manager.py` | Profil akcji – Tap/Swipe/Makro (w tym `repeat_delay_ms` dla tapów), zapis/odczyt `keymap.json` |
 | `stream_widget.py` | Podgląd ekranu (scrcpy) z nakładką, gestami, drag & drop i interaktywnym sterowaniem (tap/swipe) |
 | `device_panel.py` | Panel połączeń – lista urządzeń, USB/Wi-Fi, wskaźnik LED ADB |
-| `action_editor.py` | Formularz akcji – Tap/Swipe/Makro, edytor i podgląd kroków |
+| `action_editor.py` | Formularz akcji – Tap/Swipe/Makro, edytor i podgląd kroków, zwłoka powtórzenia tapu |
 | `keymapper_widget.py` | Przełącznik keymappera + silnik nasłuchu klawiszy (pynput) |
-| `macro_runner.py` | Wątek odtwarzania makr z sygnałami postępu kroków |
+| `macro_runner.py` | Wątek odtwarzania makr z sygnałami postępu kroków + `TapRepeatWorker` (pętla tapów w trybie Powtarzanie) |
 | `ad_killer_module.py` | Moduł AI Ad Killer – worker QThread z inferencją YOLOv11/ONNX (onnxruntime) |
 | `ad_killer_ui.py` | Okno konfiguracji Ad Killer – wybór modelu `.onnx`, czułość (confidence), interwał |
 | `models/` | Katalog na model ONNX (`ad_detector.onnx`) dla Ad Killer |

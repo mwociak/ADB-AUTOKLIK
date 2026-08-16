@@ -46,6 +46,7 @@ from PyQt6.QtWidgets import (
 
 from config_manager import (
     ConfigManager,
+    KeyPoint,
     MacroPoint,
     SwipePoint,
     delay_action,
@@ -145,6 +146,25 @@ class ActionEditor(QWidget):
         self.delete_button.setEnabled(False)
         points_layout.addWidget(self.table, 1)
         points_layout.addWidget(self.delete_button)
+        # Zwłoka przed kolejnym powtórzeniem tapu (widoczna tylko dla
+        # zaznaczonego tapu w trybie Powtarzanie).
+        self.repeat_delay_row = QWidget()
+        repeat_layout = QHBoxLayout(self.repeat_delay_row)
+        repeat_layout.setContentsMargins(0, 0, 0, 0)
+        repeat_layout.addWidget(QLabel("🔁 Zwłoka powtórzenia:"))
+        self.repeat_delay_spin = QSpinBox()
+        self.repeat_delay_spin.setRange(0, 60_000)
+        self.repeat_delay_spin.setValue(500)
+        self.repeat_delay_spin.setSuffix(" ms")
+        self.repeat_delay_spin.setToolTip(
+            "Zwłoka przed kolejnym tapnięciem w trybie Powtarzanie "
+            "(0 = domyślna 500 ms)"
+        )
+        self.repeat_delay_apply_button = QPushButton("Zastosuj")
+        repeat_layout.addWidget(self.repeat_delay_spin, 1)
+        repeat_layout.addWidget(self.repeat_delay_apply_button)
+        self.repeat_delay_row.setVisible(False)
+        points_layout.addWidget(self.repeat_delay_row)
         root.addWidget(points_box, 1)
 
         # --- Dodawanie akcji ---
@@ -237,6 +257,7 @@ class ActionEditor(QWidget):
         self.macro_steps_list.itemClicked.connect(self._on_macro_step_clicked)
         self.step_save_button.clicked.connect(self._on_step_save)
         self.step_replace_button.clicked.connect(self._on_step_replace)
+        self.repeat_delay_apply_button.clicked.connect(self._on_repeat_delay_apply)
 
     # ------------------------------------------------------------------
     # Tabela akcji
@@ -272,6 +293,7 @@ class ActionEditor(QWidget):
         row = self.table.currentRow()
         if row < 0:
             self._stop_editing_macro()
+            self._show_repeat_delay_row(None)
             return
         name = self.table.item(row, 1).text()
         point = self.config.get_point(name)
@@ -279,6 +301,33 @@ class ActionEditor(QWidget):
             self._start_editing_macro(point.name)
         else:
             self._stop_editing_macro()
+        # Tylko tap ma zwłokę powtórzenia - pokaż edytor tylko dla niego.
+        self._show_repeat_delay_row(point if isinstance(point, KeyPoint) else None)
+
+    def _show_repeat_delay_row(self, point: KeyPoint | None) -> None:
+        """Pokazuje edytor zwłoki powtórzenia tylko dla zaznaczonego tapu."""
+        if point is None:
+            self.repeat_delay_row.setVisible(False)
+            return
+        self.repeat_delay_spin.setValue(max(0, point.repeat_delay_ms))
+        self.repeat_delay_row.setVisible(True)
+
+    def _on_repeat_delay_apply(self) -> None:
+        """Zapisuje zwłokę przed kolejnym powtórzeniem dla zaznaczonego tapu."""
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        name = self.table.item(row, 1).text()
+        point = self.config.get_point(name)
+        if not isinstance(point, KeyPoint):
+            self.status_message.emit("Zwłoka powtórzenia dotyczy tylko akcji Tap.")
+            return
+        point.repeat_delay_ms = self.repeat_delay_spin.value()
+        self.config.save_config()
+        self.status_message.emit(
+            f"Ustawiono zwłokę powtórzenia '{point.name}': "
+            f"{point.repeat_delay_ms} ms"
+        )
 
     def _on_delete_point(self) -> None:
         row = self.table.currentRow()

@@ -8,7 +8,8 @@ Format pliku JSON::
 
     {
       "points": [
-        {"kind": "tap", "name": "Skill 1", "key": "a", "x": 450, "y": 1200},
+        {"kind": "tap", "name": "Skill 1", "key": "a", "x": 450, "y": 1200,
+         "repeat_delay_ms": 500},
         {"kind": "swipe", "name": "Dash", "key": "space",
          "x1": 900, "y1": 1500, "x2": 300, "y2": 1500, "duration_ms": 300},
         {"kind": "macro", "name": "Combo", "key": "q", "actions": [
@@ -21,7 +22,10 @@ Format pliku JSON::
     }
 
 Kompatybilność wsteczna: wpisy bez pola ``kind`` (stary format, tylko
-tap) są nadal poprawnie wczytywane jako :class:`KeyPoint`.
+tap) są nadal poprawnie wczytywane jako :class:`KeyPoint`. Opcjonalne
+pole ``repeat_delay_ms`` (tylko dla tapów) to zwłoka w milisekundach
+przed kolejnym powtórzeniem tapnięcia w trybie Powtarzanie
+(0 = domyślna wartość programu).
 """
 
 from __future__ import annotations
@@ -92,6 +96,7 @@ class KeyPoint:
     key: str
     x: int
     y: int
+    repeat_delay_ms: int = 0
 
     KIND = "tap"
 
@@ -107,6 +112,7 @@ class KeyPoint:
             key=str(data.get("key", "")).strip().lower(),
             x=int(data.get("x", 0)),
             y=int(data.get("y", 0)),
+            repeat_delay_ms=int(data.get("repeat_delay_ms", 0)),
         )
 
 

@@ -35,10 +35,10 @@ from PyQt6.QtWidgets import (
 from action_editor import ActionEditor, _plural_steps
 from ad_killer_module import AIAdKillerWorker
 from adb_controller import ADBController
-from config_manager import ConfigManager, MacroPoint, SwipePoint
+from config_manager import ConfigManager, KeyPoint, MacroPoint, SwipePoint
 from device_panel import DevicePanel
 from keymapper_widget import KeymapperWidget
-from macro_runner import MacroRunner
+from macro_runner import DEFAULT_REPEAT_DELAY_MS, MacroRunner, TapRepeatWorker
 from nav_bar_widget import NavigationBar, NavigationWorker
 from stream_widget import CONTROL_SWIPE_DURATION_MS, AndroidScreenWidget, ControlWorker
 
@@ -70,10 +70,15 @@ class MainWindow(QMainWindow):
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
         self._ad_killer: AIAdKillerWorker | None = None
         self._ad_killer_dialog = None  # AdKillerConfigDialog (tworzony leniwie)
+        # Tryb Powtarzanie: ostatnia wybrana akcja (tap LUB makro) powtarza
+        # się w pętli, aż do wyłączenia przełącznika.
+        self._tap_repeater: TapRepeatWorker | None = None
+        self._repeat_macro: MacroPoint | None = None
         # Zatrzymane workery, które jeszcze kończą wątek w tle - trzymamy
         # referencje, żeby QThread nie został zniszczony w trakcie działania
         # (zapobiega nakładaniu się wielu instancji po wielokrotnym WŁ/WYŁ).
         self._retired_ad_killers: list[AIAdKillerWorker] = []
+        self._retired_tap_repeaters: list[TapRepeatWorker] = []
 
         self._build_ui()
         self._wire_signals()
@@ -123,6 +128,13 @@ class MainWindow(QMainWindow):
         self.mode_group.addButton(self.map_btn)
         topbar.addWidget(self.control_btn)
         topbar.addWidget(self.map_btn)
+        self.repeat_check = QCheckBox("🔁 Powtarzanie [WYŁ]")
+        self.repeat_check.setToolTip(
+            "Powtarza wybraną akcję w pętli aż do wyłączenia: makro zaczyna "
+            "się od początku po zakończeniu, a tap powtarza się co ustawioną "
+            "zwłokę (patrz: Zwłoka powtórzenia po zaznaczeniu tapu w tabeli)"
+        )
+        topbar.addWidget(self.repeat_check)
         self.ad_killer_check = QCheckBox("🛡️ Auto-Zamykanie [WYŁ]")
         self.ad_killer_check.setToolTip(
             "Automatycznie zamyka reklamy (AI - model YOLOv11/ONNX przez onnxruntime)"
@@ -206,6 +218,9 @@ class MainWindow(QMainWindow):
 
         # Multi-Device Control
         self.multi_device_button.clicked.connect(self._open_multi_device)
+
+        # Tryb Powtarzanie (pętla dla tapu / makra)
+        self.repeat_check.toggled.connect(self._on_repeat_toggled)
 
         # Ad Killer (automatyczne zamykanie reklam)
         self.ad_killer_check.toggled.connect(self._on_ad_killer_toggled)
@@ -375,6 +390,72 @@ class MainWindow(QMainWindow):
         self.device_panel.set_adb_status("ok" if ok else "error")
 
     # ------------------------------------------------------------------
+    # Tryb Powtarzanie (pętla: makro od początku / tap co zwłokę)
+    # ------------------------------------------------------------------
+
+    def _on_repeat_toggled(self, checked: bool) -> None:
+        """Włącza/wyłącza powtarzanie wybranej akcji (tap lub makro)."""
+        self.repeat_check.setText(
+            "🔁 Powtarzanie [WŁ]" if checked else "🔁 Powtarzanie [WYŁ]"
+        )
+        if not checked:
+            # Zatrzymaj bieżącą pętlę: makro i/lub powtarzany tap.
+            self._repeat_macro = None
+            if self._macro_runner is not None:
+                self._macro_runner.stop()
+            self._stop_tap_repeater()
+            self._status("🔁 Powtarzanie wyłączone.")
+        else:
+            self._status(
+                "🔁 Powtarzanie włączone - tapy i makra powtarzają się aż do wyłączenia."
+            )
+
+    def _start_tap_repeat(self, point: KeyPoint) -> None:
+        """Uruchamia pętlę tapnięć (tap -> zwłoka -> tap) w osobnym wątku."""
+        if self.adb.device_serial is None:
+            return
+        if self._tap_repeater is not None and self._tap_repeater.is_alive():
+            self._status("🔁 Powtarzanie tapu już trwa - pomijam klawisz.")
+            return
+        if self._macro_runner is not None and self._macro_runner.is_alive():
+            # Nowy wybór przejmuje pętlę - zatrzymaj poprzednie makro.
+            self._macro_runner.stop()
+        delay_ms = (
+            point.repeat_delay_ms
+            if point.repeat_delay_ms > 0
+            else DEFAULT_REPEAT_DELAY_MS
+        )
+        worker = TapRepeatWorker(self.adb, point.x, point.y, delay_ms)
+        worker.tap_result.connect(self._on_control_finished)
+        worker.finished.connect(
+            lambda w=worker: self._on_tap_repeater_finished(w)
+        )
+        self._tap_repeater = worker
+        worker.start()
+        self._status(
+            f"🔁 Powtarzam tap '{point.name}' co {delay_ms} ms "
+            f"(wyłącz Powtarzanie, aby zatrzymać)"
+        )
+
+    def _stop_tap_repeater(self) -> None:
+        """Zatrzymuje pętlę tapnięć (nie blokuje GUI - wątek kończy w tle)."""
+        worker = self._tap_repeater
+        self._tap_repeater = None
+        if worker is not None:
+            worker.stop()
+            self._retired_tap_repeaters.append(worker)
+            if not worker.is_alive():
+                self._on_tap_repeater_finished(worker)
+
+    def _on_tap_repeater_finished(self, worker: TapRepeatWorker) -> None:
+        """Sprząta po zakończonym workerze powtarzania tapu."""
+        if self._tap_repeater is worker:
+            self._tap_repeater = None
+        if worker in self._retired_tap_repeaters:
+            self._retired_tap_repeaters.remove(worker)
+        worker.deleteLater()
+
+    # ------------------------------------------------------------------
     # Tryby edytora -> stream i keymapper
     # ------------------------------------------------------------------
 
@@ -475,6 +556,10 @@ class MainWindow(QMainWindow):
                 point.x1, point.y1, point.x2, point.y2, point.duration_ms
             )
         else:
+            if self.repeat_check.isChecked():
+                # Tryb Powtarzanie: tap w pętli aż do wyłączenia.
+                self._start_tap_repeat(point)
+                return
             ok = self.adb.tap(point.x, point.y)
         self.device_panel.set_adb_status("ok" if ok else "error")
         if not ok:
@@ -495,6 +580,10 @@ class MainWindow(QMainWindow):
         if self._macro_runner is not None and self._macro_runner.is_alive():
             self._status(f"Makro już trwa - pomijam klawisz '{point.key}'")
             return
+        self._repeat_macro = point  # do restartu pętli po zakończeniu
+        if self.repeat_check.isChecked():
+            # Nowy wybór przejmuje pętlę - zatrzymaj powtarzany tap.
+            self._stop_tap_repeater()
         runner = MacroRunner(self.adb, point.actions)
         runner.step_started.connect(self._on_macro_step_started)
         runner.step_result.connect(self._on_macro_step_result)
@@ -516,6 +605,18 @@ class MainWindow(QMainWindow):
     def _on_macro_completed(self, finished: bool) -> None:
         self._macro_runner = None
         self.action_editor.end_macro_preview()
+        macro = self._repeat_macro
+        if (
+            finished
+            and macro is not None
+            and self.repeat_check.isChecked()
+            and self.adb.device_serial is not None
+        ):
+            # Tryb Powtarzanie: zaczynamy od początku aż do wyłączenia.
+            self._status("🔁 Makro zakończone - powtarzam od początku.")
+            self._start_macro(macro)
+            return
+        self._repeat_macro = None
         self._status("Makro zakończone." if finished else "Makro przerwane.")
 
     # ------------------------------------------------------------------
@@ -528,6 +629,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (nazwa Qt)
         if self._macro_runner is not None:
             self._macro_runner.stop()
+        self._stop_tap_repeater()
+        for worker in list(self._retired_tap_repeaters):
+            worker.stop()
         if self._ad_killer is not None:
             self._ad_killer.stop()
         for worker in list(self._retired_ad_killers):
