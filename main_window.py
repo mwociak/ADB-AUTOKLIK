@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from action_editor import ActionEditor, _plural_steps
-from ad_killer_module import AdKillerWorker
+from ad_killer_module import AIAdKillerWorker
 from adb_controller import ADBController
 from config_manager import ConfigManager, MacroPoint, SwipePoint
 from device_panel import DevicePanel
@@ -68,12 +68,12 @@ class MainWindow(QMainWindow):
         self._nav_worker: NavigationWorker | None = None
         self._control_worker: ControlWorker | None = None
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
-        self._ad_killer: AdKillerWorker | None = None
+        self._ad_killer: AIAdKillerWorker | None = None
         self._ad_killer_dialog = None  # AdKillerConfigDialog (tworzony leniwie)
         # Zatrzymane workery, które jeszcze kończą wątek w tle - trzymamy
         # referencje, żeby QThread nie został zniszczony w trakcie działania
         # (zapobiega nakładaniu się wielu instancji po wielokrotnym WŁ/WYŁ).
-        self._retired_ad_killers: list[AdKillerWorker] = []
+        self._retired_ad_killers: list[AIAdKillerWorker] = []
 
         self._build_ui()
         self._wire_signals()
@@ -125,13 +125,13 @@ class MainWindow(QMainWindow):
         topbar.addWidget(self.map_btn)
         self.ad_killer_check = QCheckBox("🛡️ Auto-Zamykanie [WYŁ]")
         self.ad_killer_check.setToolTip(
-            "Automatycznie zamyka reklamy (OpenCV Template Matching)"
+            "Automatycznie zamyka reklamy (AI - model YOLOv11/ONNX przez onnxruntime)"
         )
         topbar.addWidget(self.ad_killer_check)
         topbar.addStretch(1)
         self.ad_killer_config_button = QPushButton("🛡️ Ad Killer Config")
         self.ad_killer_config_button.setToolTip(
-            "Konfiguracja Ad Killer: wzorce reklam, czułość, interwał skanowania"
+            "Konfiguracja Ad Killer: model ONNX, czułość (confidence), interwał"
         )
         topbar.addWidget(self.ad_killer_config_button)
         self.multi_device_button = QPushButton("🌐 Multi-Device Control")
@@ -234,12 +234,12 @@ class MainWindow(QMainWindow):
         if self._ad_killer_dialog is None:
             from ad_killer_ui import AdKillerConfigDialog
 
-            self._ad_killer_dialog = AdKillerConfigDialog(self.stream)
+            self._ad_killer_dialog = AdKillerConfigDialog()
             self._ad_killer_dialog.settings_changed.connect(
                 self._on_ad_killer_settings
             )
-            self._ad_killer_dialog.templates_changed.connect(
-                self._on_ad_templates_changed
+            self._ad_killer_dialog.model_changed.connect(
+                self._on_ad_model_changed
             )
         self._ad_killer_dialog.show()
         self._ad_killer_dialog.raise_()
@@ -255,14 +255,17 @@ class MainWindow(QMainWindow):
                 # Zabezpieczenie przed nakładaniem się wątków skanowania.
                 self._status("🛡️ Ad Killer już działa - pomijam start.")
                 return
-            threshold = 0.8
+            threshold = 0.7
             interval_ms = 1500
+            model_path = None
             if self._ad_killer_dialog is not None:
                 threshold = self._ad_killer_dialog.threshold
                 interval_ms = self._ad_killer_dialog.interval_ms
-            worker = AdKillerWorker(
+                model_path = self._ad_killer_dialog.model_path
+            worker = AIAdKillerWorker(
                 self.adb,
                 self.stream,
+                model_path=model_path,
                 threshold=threshold,
                 interval_ms=interval_ms,
             )
@@ -271,7 +274,7 @@ class MainWindow(QMainWindow):
             self._ad_killer = worker
             worker.start()
             self._status(
-                f"🛡️ Ad Killer aktywny (próg {threshold:.0%}, co {interval_ms} ms)"
+                f"🛡️ Ad Killer aktywny (AI, próg {threshold:.0%}, co {interval_ms} ms)"
             )
         else:
             worker = self._ad_killer
@@ -290,7 +293,7 @@ class MainWindow(QMainWindow):
                     self._on_ad_killer_retired(worker)
             self._status("🛡️ Ad Killer wyłączony.")
 
-    def _on_ad_killer_retired(self, worker: AdKillerWorker) -> None:
+    def _on_ad_killer_retired(self, worker: AIAdKillerWorker) -> None:
         """Sprząta po zatrzymanym workerze (wątek zakończył pracę)."""
         if worker in self._retired_ad_killers:
             self._retired_ad_killers.remove(worker)
@@ -302,10 +305,11 @@ class MainWindow(QMainWindow):
             self._ad_killer.set_threshold(threshold)
             self._ad_killer.set_interval_ms(interval_ms)
 
-    def _on_ad_templates_changed(self) -> None:
-        """Dodano wzorzec - przeładuj listę w działającym workerce."""
+    def _on_ad_model_changed(self, model_path: str) -> None:
+        """Wybrano nowy model ONNX - podmień w działającym workerce."""
         if self._ad_killer is not None:
-            self._ad_killer.reload_templates()
+            self._ad_killer.set_model_path(model_path)
+            self._status(f"🛡️ Nowy model Ad Killer: {model_path}")
 
     def _on_ad_detected(self, x: int, y: int) -> None:
         """Wykryto i zamknięto reklamę - LED ADB + komunikat."""

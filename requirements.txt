@@ -29,5 +29,8 @@ scrcpy-client @ git+https://github.com/leng-yue/py-scrcpy-client.git@ad57b15934c
 av>=12
 numpy>=2
 
-# Wykrywanie wzorców (Template Matching) dla modułu Ad Killer
+# AI Ad Killer - detekcja reklam modelem YOLOv11 (ONNX)
+# onnxruntime: inferencja modelu ad_detector.onnx (bez PyTorcha/Ultralytics)
+# opencv-python + numpy: przetwarzanie klatki (BGR->RGB, resize, letterbox)
+onnxruntime>=1.17
 opencv-python>=4.8

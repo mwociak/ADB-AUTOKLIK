@@ -21,7 +21,11 @@ scrcpy-server.jar``. Skrypt znajduje jar w zainstalowanym pakiecie
 Dodatkowo skrypt dopina ``--collect-all av`` (binaria/kodeki PyAV, które
 PyInstaller nie wykrywa w pełni automatycznie), ``--collect-all cv2``
 (OpenCV - pliki .pyd/.dll ładowane dynamicznie, wymagane przez moduł
-Ad Killer) oraz dołącza katalog ``ad_templates/`` (wzorce reklam).
+Ad Killer) oraz ``--collect-all onnxruntime`` (binaria/pliki danych
+inferencji ONNX dla AI Ad Killera). Dołączany jest też katalog
+``models/`` (startowy model YOLOv11 ``ad_detector.onnx``) - w wersji
+spakowanej model leży w ``sys._MEIPASS/models/``, a użytkownik może
+podmienić plik obok .exe.
 Dopięte są też jawne hidden-importy dla ``pynput`` na Windows (moduły
 platformowe ładowane dynamicznie). Plik ``icon.ico`` z repozytorium jest
 przekazywany przez ``--icon`` jako ikona .exe i okna aplikacji.
@@ -66,15 +70,24 @@ def main() -> int:
     else:
         print("[build] UWAGA: brak pliku icon.ico obok build.py - buduję bez ikony")
 
-    templates_dir = PROJECT_ROOT / "ad_templates"
-    if templates_dir.is_dir():
-        print(f"[build] wzorce ad_templates/: {templates_dir}")
+    models_dir = PROJECT_ROOT / "models"
+    if models_dir.is_dir():
+        print(f"[build] katalog modeli AI: {models_dir}")
+        model = models_dir / "ad_detector.onnx"
+        if model.is_file():
+            print(f"[build] model ONNX: {model}")
+        else:
+            print(
+                "[build] UWAGA: brak models/ad_detector.onnx - buduję bez "
+                "wbudowanego modelu Ad Killer (użytkownik musi dostarczyć "
+                "plik obok .exe)"
+            )
     else:
-        print("[build] UWAGA: brak katalogu ad_templates/ - buduję bez wzorców reklam")
+        print("[build] UWAGA: brak katalogu models/ - buduję bez modelu AI Ad Killer")
 
     # Separator --add-data zależy od platformy (Windows: ';', POSIX: ':'),
     # dlatego używamy os.pathsep. Cel "scrcpy" = _MEIPASS/scrcpy/ w bundlu,
-    # a "ad_templates" - dołączone wzorce startowe reklam.
+    # a "models" - startowy model ONNX Ad Killera (fallback: plik obok .exe).
     cmd = [
         sys.executable,
         "-m",
@@ -87,10 +100,10 @@ def main() -> int:
         "--add-data",
         f"{jar}{os.pathsep}scrcpy",
     ]
-    if templates_dir.is_dir():
+    if models_dir.is_dir():
         cmd += [
             "--add-data",
-            f"{templates_dir}{os.pathsep}ad_templates",
+            f"{models_dir}{os.pathsep}models",
         ]
     cmd += [
         # Ikona aplikacji (icon.ico) - ustawia ikonę pliku .exe i okna.
@@ -99,9 +112,12 @@ def main() -> int:
         # PyAV: podmoduły, pliki danych i binaria (nie wykrywane w pełni automatycznie)
         "--collect-all",
         "av",
-        # OpenCV: pliki .pyd/.dll ładowane dynamicznie (Ad Killer - Template Matching)
+        # OpenCV: pliki .pyd/.dll ładowane dynamicznie (Ad Killer - AI)
         "--collect-all",
         "cv2",
+        # onnxruntime: binaria/pliki danych inferencji (AI Ad Killer - YOLOv11/ONNX)
+        "--collect-all",
+        "onnxruntime",
         "--hidden-import",
         "adbutils",
     ]

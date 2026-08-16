@@ -52,13 +52,13 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
   - akcje zbiorcze: **uruchom aplikację po nazwie pakietu na wszystkich**, **sync tapu (X, Y) na wszystkich**, odświeżanie podglądów,
   - odłączanie urządzeń z siatki.
 
-### Ad Killer 🛡️ (automatyczne zamykanie reklam)
-- Skanuje klatki streamu w **osobnym wątku** i szuka wzorców reklam (np. krzyżyków „X") metodą **OpenCV Template Matching** (`cv2.matchTemplate`, grayscale, multi-skala – wzorce bywają różnej wielkości).
-- Wzorce to obrazy PNG w katalogu **`ad_templates/`**; gdy dopasowanie przekroczy próg czułości (domyślnie **80%**), aplikacja wysyła tap na środek wzorca i wstrzymuje skanowanie na 3 s.
+### Ad Killer 🛡️ (automatyczne zamykanie reklam – AI)
+- Skanuje klatki streamu w **osobnym wątku** i wykrywa przyciski zamykania reklam lekkim modelem detekcji obiektów **YOLOv11 wyeksportowanym do ONNX** (np. `models/ad_detector.onnx`).
+- Inferencja działa przez **`onnxruntime`** (bez ciężkiego PyTorcha/Ultralytics): klatka skalowana jest letterboxem do rozmiaru modelu (640×640), normalizowana i analizowana; detekcje powyżej progu pewności (domyślnie **70%**) dla klas `close` / `skip` / `dismiss` są klikane w środku bounding boxa przez ADB.
 - **🛡️ Auto-Zamykanie [WŁ/WYŁ]** na pasku głównym startuje/zatrzymuje skanowanie.
-- **🛡️ Ad Killer Config** – okno konfiguracji: podgląd wzorców (miniatury), suwak czułości, interwał skanowania (ms) oraz dwa sposoby dodawania wzorców:
-  - **z ekranu** – zaznaczysz prostokąt na podglądzie telefonu (z ostatniej klatki streamu),
-  - **z pliku (Offline)** – wytnij wzorzec ze statycznego zrzutu ekranu (PNG/JPG) **bez podłączonego urządzenia**; okno wycina zaznaczony prostokąt (przelicza skalę na oryginalne wymiary) i zapisuje go jako `template_N.png`.
+- **🛡️ Ad Killer Config** – okno konfiguracji: wybór pliku modelu `.onnx` (📂 Przeglądaj…), suwak czułości (confidence threshold), interwał skanowania (ms) oraz podgląd załadowanych klas (z opcjonalnego pliku `<model>.names`).
+- Bezpieczne działanie: wątek można zatrzymać w każdej chwili (bez nakładania się instancji), GUI nie jest blokowane, a po kliknięciu reklamy skanowanie robi przerwę (cooldown), żeby nie klikać wielokrotnie.
+- Eksport modelu (np. z Ultralytics): `yolo export model=ad_detector.pt format=onnx imgsz=640` – wytrenowany na klasach zamykania reklam (`close`, `skip`, `dismiss`).
 
 ### Zapisywanie i kompatybilność
 - Wszystkie akcje trzymane w **`keymap.json`** (prosty JSON – możesz edytować ręcznie).
@@ -76,7 +76,8 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
 | **adbutils** | komunikacja z ADB (`input tap/swipe`, `screencap`, połączenia) |
 | **scrcpy-client** | strumieniowanie ekranu telefonu (H.264) |
 | **av + numpy** | dekodowanie i przetwarzanie klatek wideo |
-| **opencv-python** | wykrywanie wzorców reklam – Ad Killer (Template Matching) |
+| **onnxruntime** | inferencja modelu YOLOv11/ONNX – Ad Killer (AI) |
+| **opencv-python** | przetwarzanie klatek (letterbox, BGR→RGB) – Ad Killer (AI) |
 | **PyInstaller** | budowanie samodzielnego `.exe` (skrypt `build.py`) |
 
 ---
@@ -140,11 +141,12 @@ W oknie aplikacji:
 
 Kliknij **🌐 Multi-Device Control** w górnym pasku głównego okna. W oknie farmy urządzeń dodawaj telefony z listy ADB lub ręcznie po `IP:port`, a następnie używaj akcji zbiorczych (uruchomienie aplikacji / sync tapu na wszystkich urządzeniach).
 
-### Ad Killer
+### Ad Killer (AI)
 
-1. Otwórz **🛡️ Ad Killer Config** i dodaj wzorce reklam (z ekranu albo z pliku offline) albo wrzuć własne PNG do katalogu `ad_templates/`.
-2. Zaznacz **🛡️ Auto-Zamykanie [WŁ]** – aplikacja sama wykryje krzyżyki reklam na streamie i zamknie je tapem.
-3. Czujność dopasowania i częstotliwość skanowania regulujesz w oknie konfiguracji (próg, interwał w ms).
+1. Umieść model **YOLOv11/ONNX** w katalogu `models/` (np. `models/ad_detector.onnx`) – wyeksportowany np. komendą `yolo export model=ad_detector.pt format=onnx imgsz=640`.
+2. Otwórz **🛡️ Ad Killer Config** i wskaż plik modelu (📂 Przeglądaj…) – okno pokaże stan modelu i klasy (close/skip/dismiss, ewentualnie z pliku `<model>.names`).
+3. Zaznacz **🛡️ Auto-Zamykanie [WŁ]** – aplikacja sama wykryje przyciski zamykania reklam na streamie i kliknie je w środku.
+4. Czułość detekcji (confidence threshold) i częstotliwość skanowania regulujesz w oknie konfiguracji (próg, interwał w ms).
 
 ---
 
@@ -161,8 +163,8 @@ Skrypt `build.py` automatycznie:
 
 - dołącza **`scrcpy-server.jar`** do bundla w miejscu `sys._MEIPASS/scrcpy/`, którego oczekuje biblioteka (bez tego stream wywala „Failed to connect scrcpy-server after 3 seconds"),
 - ustawia **ikonę aplikacji** z pliku `icon.ico` (znajduje się w repozytorium),
-- zbiera binaria/kodeki **PyAV** (`--collect-all av`) i **OpenCV** (`--collect-all cv2` – .pyd/.dll ładowane dynamicznie, wymagane przez Ad Killer),
-- dołącza katalog **`ad_templates/`** ze wzorcami reklam (wzorce dodane przez użytkownika lądują obok pliku .exe i nie znikają po restarcie),
+- zbiera binaria/kodeki **PyAV** (`--collect-all av`), **OpenCV** (`--collect-all cv2` – .pyd/.dll ładowane dynamicznie) i **onnxruntime** (`--collect-all onnxruntime` – binaria inferencji ONNX, wymagane przez AI Ad Killer),
+- dołącza katalog **`models/`** z modelem ONNX (`ad_detector.onnx`); w wersji spakowanej model leży w `sys._MEIPASS/models/`, a użytkownik może podmienić plik obok .exe (nie znika po restarcie),
 - dopina ukryte importy **pynput** dla Windows (`pynput.keyboard._win32`, `pynput.mouse._win32`) – bez nich keymapper milczy w spakowanej wersji.
 
 > 💡 Ikona jest używana tylko jeśli plik `icon.ico` leży obok `build.py` – gdy go brakuje, build przechodzi bez ikony (z ostrzeżeniem).
@@ -182,9 +184,9 @@ Skrypt `build.py` automatycznie:
 | `action_editor.py` | Formularz akcji – Tap/Swipe/Makro, edytor i podgląd kroków |
 | `keymapper_widget.py` | Przełącznik keymappera + silnik nasłuchu klawiszy (pynput) |
 | `macro_runner.py` | Wątek odtwarzania makr z sygnałami postępu kroków |
-| `ad_killer_module.py` | Moduł Ad Killer – worker QThread z Template Matching (OpenCV) |
-| `ad_killer_ui.py` | Okno konfiguracji Ad Killer – wzorce, czułość, interwał + wycinanie wzorca z pliku (OfflineCropDialog) |
-| `ad_templates/` | Wzorce reklam (PNG) dla Ad Killer |
+| `ad_killer_module.py` | Moduł AI Ad Killer – worker QThread z inferencją YOLOv11/ONNX (onnxruntime) |
+| `ad_killer_ui.py` | Okno konfiguracji Ad Killer – wybór modelu `.onnx`, czułość (confidence), interwał |
+| `models/` | Katalog na model ONNX (`ad_detector.onnx`) dla Ad Killer |
 | `multi_device_window.py` | Farma urządzeń – kafelki telefonów i akcje zbiorcze |
 | `nav_bar_widget.py` | Pasek nawigacji telefonu – Wstecz/Home/Ostatnie + wygaszanie/wybudzanie ekranu |
 | `build.py` | Skrypt PyInstaller – budowa `dist/ADB-AUTOKLIK.exe` |
