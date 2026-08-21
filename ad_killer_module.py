@@ -62,6 +62,22 @@ DETECT_ALL_CLASSES: frozenset[str] = frozenset()
 # Rozmiar wejściowy modelu (imgsz użyty przy eksporcie).
 DEFAULT_INPUT_SIZE = 640
 
+# ---------------------------------------------------------------------------
+# Wzorce ręczne ("zaznacz na ekranie") - drugie źródło detekcji obok modelu
+# ONNX. Użytkownik zaznacza myszką przycisk zamknięcia/pominięcia reklamy na
+# podglądzie streamu, fragment zapisuje się jako PNG w ``ad_templates/``, a
+# worker szuka go na klatkach przez ``cv2.matchTemplate`` (skala szarości,
+# TM_CCOEFF_NORMED, kilka skal). Działa BEZ wytrenowanego modelu.
+# ---------------------------------------------------------------------------
+DEFAULT_TEMPLATE_THRESHOLD = 0.8
+
+# Skale przeszukiwania - krzyżyki/przyciski bywają różnej wielkości zależnie
+# od rozdzielczości i reklam.
+_TEMPLATE_SCALES = (1.0, 0.9, 0.8, 0.7, 0.6, 1.1, 1.25, 1.5)
+
+# Minimalny rozmiar wycinka (px) - mniejsze zaznaczenia są odrzucane.
+MIN_TEMPLATE_SIZE = 8
+
 # Wartość wypełnienia letterboxa (standard Ultralytics: szary 114).
 _LETTERBOX_VALUE = 114.0
 
@@ -88,6 +104,115 @@ def default_model_path() -> str:
     else:
         base = os.getcwd()
     return os.path.join(base, "models", "ad_detector.onnx")
+
+
+def default_templates_dir() -> str:
+    """Zwraca katalog wzorców ręcznych (``ad_templates/``).
+
+    W wersji spakowanej PyInstallerem katalog leży obok .exe (wzorce dodane
+    przez użytkownika nie znikają po restarcie); w trybie źródłowym - w
+    bieżącym katalogu roboczym. Katalog jest tworzony, jeśli go nie ma.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.getcwd()
+    path = os.path.join(base, "ad_templates")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def load_templates(
+    templates_dir: str | None = None,
+) -> list[tuple[str, np.ndarray]]:
+    """Wczytuje wzorce PNG (skala szarości) z katalogu ``ad_templates/``.
+
+    Zwraca listę ``(nazwa_pliku, obraz_gray)``. Uszkodzone/nieczytelne
+    pliki są pomijane z logiem - worker nigdy nie umiera przez jeden zły
+    plik.
+    """
+    directory = templates_dir or default_templates_dir()
+    templates: list[tuple[str, np.ndarray]] = []
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return templates
+    for entry in entries:
+        if not entry.lower().endswith((".png", ".jpg", ".jpeg")):
+            continue
+        path = os.path.join(directory, entry)
+        image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if image is None or image.size == 0:
+            _log(f"Pomijam uszkodzony wzorzec: {path}")
+            continue
+        templates.append((entry, image))
+    return templates
+
+
+def find_template_match(
+    frame: np.ndarray,
+    templates: list[tuple[str, np.ndarray]],
+    threshold: float,
+) -> tuple[float, int, int, str] | None:
+    """Szuka wzorców na klatce (Template Matching, kilka skal).
+
+    Porównuje każdą parę (wzorzec × skala) z klatką w skali szarości
+    (``cv2.TM_CCOEFF_NORMED``) i zwraca najlepsze trafienie powyżej
+    ``threshold`` jako ``(score, cx, cy, nazwa)`` - środek dopasowania w
+    natywnych współrzędnych klatki - albo ``None``. Dla każdego wzorca
+    loguje najwyższy uzyskany ``max_val`` (diagnostyka progu).
+    """
+    if not templates:
+        return None
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    fh, fw = gray.shape[:2]
+    best: tuple[float, int, int, str] | None = None
+    for name, template in templates:
+        th, tw = template.shape[:2]
+        template_best = 0.0
+        for scale in _TEMPLATE_SCALES:
+            new_w, new_h = int(round(tw * scale)), int(round(th * scale))
+            if new_w < MIN_TEMPLATE_SIZE or new_h < MIN_TEMPLATE_SIZE:
+                continue
+            if new_w >= fw or new_h >= fh:
+                continue  # wzorzec większy niż klatka w tej skali
+            scaled = (
+                template
+                if scale == 1.0
+                else cv2.resize(
+                    template, (new_w, new_h), interpolation=cv2.INTER_AREA
+                )
+            )
+            result = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            template_best = max(template_best, float(max_val))
+            if float(max_val) >= threshold:
+                cx = max_loc[0] + new_w // 2
+                cy = max_loc[1] + new_h // 2
+                if best is None or float(max_val) > best[0]:
+                    best = (float(max_val), int(cx), int(cy), name)
+        _log(f"wzorzec '{name}': max_val={template_best:.3f} (próg {threshold:.2f})")
+    return best
+
+
+def save_template_crop(crop: np.ndarray, templates_dir: str | None = None) -> str:
+    """Zapisuje wycinek jako ``template_N.png`` (pierwszy wolny numer).
+
+    Zwraca ścieżkę zapisanego pliku. Nie nadpisuje istniejących wzorców.
+    """
+    directory = templates_dir or default_templates_dir()
+    os.makedirs(directory, exist_ok=True)
+    index = 1
+    while True:
+        path = os.path.join(directory, f"template_{index}.png")
+        if not os.path.exists(path):
+            if not cv2.imwrite(path, crop):
+                raise OSError(f"Nie można zapisać wzorca: {path}")
+            return path
+        index += 1
 
 
 def letterbox(
@@ -335,6 +460,8 @@ class AIAdKillerWorker(QThread):
         interval_ms: int = 1500,
         cooldown_s: float = 3.0,
         close_classes: frozenset[str] | None = None,
+        templates_dir: str | None = None,
+        template_threshold: float = DEFAULT_TEMPLATE_THRESHOLD,
         parent: "QObject | None" = None,
     ) -> None:
         super().__init__(parent)
@@ -352,6 +479,12 @@ class AIAdKillerWorker(QThread):
         self._class_names: list[str] | None = None
         self._input_size = DEFAULT_INPUT_SIZE
         self._loaded_model_path: str | None = None
+        # Wzorce ręczne ("zaznacz na ekranie") - drugie źródło detekcji.
+        self._templates_dir = templates_dir or default_templates_dir()
+        self._templates: list[tuple[str, np.ndarray]] = []
+        self._templates_lock = threading.Lock()
+        self._template_threshold = min(max(float(template_threshold), 0.0), 1.0)
+        self._known_templates: set[str] = set()
 
     # ------------------------------------------------------------------
     # Parametry (bezpieczne wywołania z wątku GUI)
@@ -384,6 +517,40 @@ class AIAdKillerWorker(QThread):
             self._session = None
             self._loaded_model_path = None
         _log(f"Ustawiono nowy model: {self._model_path}")
+
+    def set_template_threshold(self, threshold: float) -> None:
+        """Ustawia próg dopasowania wzorców ręcznych (0.0-1.0)."""
+        with self._lock:
+            self._template_threshold = min(max(float(threshold), 0.0), 1.0)
+
+    def reload_templates(self) -> None:
+        """Wczytuje wzorce z katalogu ``ad_templates/`` od nowa (bez cache).
+
+        Wywoływane na starcie workera i po każdej zmianie plików na dysku
+        (dodanie wzorca "zaznaczeniem na ekranie" lub ręcznie) - wzorce
+        nigdy nie są brane z cache utworzonego przy starcie aplikacji.
+        """
+        loaded = load_templates(self._templates_dir)
+        with self._templates_lock:
+            self._templates = loaded
+            self._known_templates = {name for name, _ in loaded}
+        names = ", ".join(name for name, _ in loaded) or "brak"
+        _log(f"Wczytano {len(loaded)} wzorców ręcznych z {self._templates_dir}/: {names}")
+        self.status_message.emit(
+            f"🛡️ Wzorce ręczne: {len(loaded)} (AI + matchTemplate)"
+        )
+
+    def _templates_changed_on_disk(self) -> bool:
+        """Tani check (os.listdir): czy pliki wzorców zmieniły się na dysku."""
+        try:
+            current = {
+                entry
+                for entry in os.listdir(self._templates_dir)
+                if entry.lower().endswith((".png", ".jpg", ".jpeg"))
+            }
+        except OSError:
+            return False
+        return current != self._known_templates
 
     # ------------------------------------------------------------------
     # Ładowanie modelu ONNX
@@ -474,35 +641,56 @@ class AIAdKillerWorker(QThread):
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        _log("Worker uruchomiony - rozpoczynam skanowanie")
+        _log("Worker uruchomiony - rozpoczynam skanowanie (AI + wzorce ręczne)")
+        self.reload_templates()
         while not self._stop_event.is_set():
-            if not self._ensure_session():
-                # Model niedostępny - nie mielimy CPU, spróbuj za chwilę.
-                self._stop_event.wait(2.0)
-                continue
+            # Model jest opcjonalny - worker działa też wyłącznie na
+            # wzorcach ręcznych (gdy brak pliku .onnx).
+            session_ready = self._ensure_session()
             frame = self._stream.get_latest_frame()
             if frame is None:
                 _log("Brak klatki ze streamu - czekam...")
                 self._stop_event.wait(self._interval_ms / 1000.0)
                 continue
+            # Tani check zmian na dysku - nowy wzorzec (np. właśnie
+            # zaznaczony na ekranie) działa od razu, bez restartu, nawet
+            # gdy poprzednie cykle trafiały w reklamę.
+            if self._templates_changed_on_disk():
+                self.reload_templates()
             with self._lock:
                 threshold = self._threshold
                 close_classes = self._close_classes
-            hit = self._scan_frame(frame, threshold, close_classes)
-            if hit is not None:
-                score, cx, cy, name = hit
-                if self._stop_event.is_set():
-                    break  # zatrzymano w trakcie skanowania - bez tapu
-                _log(
-                    f"WYKRYTO reklamę '{name}' (conf={score:.3f}) "
-                    f"-> tap ({cx}, {cy})"
-                )
-                if self._tap(cx, cy):
-                    self.detected.emit(cx, cy)
-                # Przerwa po trafieniu - reklama potrzebuje czasu na zamknięcie.
-                self._stop_event.wait(self._cooldown_s)
-            else:
+                template_threshold = self._template_threshold
+            hit = None
+            if session_ready:
+                hit = self._scan_frame(frame, threshold, close_classes)
+            template_hit = self._scan_templates(frame, template_threshold)
+            if template_hit is not None and (hit is None or template_hit[0] > hit[0]):
+                hit = template_hit
+            if hit is None:
                 self._stop_event.wait(self._interval_ms / 1000.0)
+                continue
+            score, cx, cy, name = hit
+            if self._stop_event.is_set():
+                break  # zatrzymano w trakcie skanowania - bez tapu
+            _log(
+                f"WYKRYTO reklamę '{name}' (score={score:.3f}) "
+                f"-> tap ({cx}, {cy})"
+            )
+            if self._tap(cx, cy):
+                self.detected.emit(cx, cy)
+            # Przerwa po trafieniu - reklama potrzebuje czasu na zamknięcie.
+            self._stop_event.wait(self._cooldown_s)
+
+    def _scan_templates(
+        self, frame: np.ndarray, threshold: float
+    ) -> tuple[float, int, int, str] | None:
+        """Szuka wzorców ręcznych na klatce (Template Matching)."""
+        with self._templates_lock:
+            templates = list(self._templates)
+        if not templates:
+            return None
+        return find_template_match(frame, templates, threshold)
 
     def _scan_frame(
         self,

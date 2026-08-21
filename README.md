@@ -59,12 +59,14 @@ Aplikacja łączy się z urządzeniem przez **ADB**, pokazuje ekran telefonu na 
   - akcje zbiorcze: **uruchom aplikację po nazwie pakietu na wszystkich**, **sync tapu (X, Y) na wszystkich**, odświeżanie podglądów,
   - odłączanie urządzeń z siatki.
 
-### Ad Killer 🛡️ (automatyczne zamykanie reklam – AI)
+### Ad Killer 🛡️ (automatyczne zamykanie reklam – AI + wzorce ręczne)
 - Skanuje klatki streamu w **osobnym wątku** i wykrywa przyciski zamykania reklam lekkim modelem detekcji obiektów **YOLOv11 wyeksportowanym do ONNX** (np. `models/ad_detector.onnx`).
 - Inferencja działa przez **`onnxruntime`** (bez ciężkiego PyTorcha/Ultralytics): klatka skalowana jest letterboxem do rozmiaru modelu (640×640), normalizowana i analizowana; detekcje powyżej progu pewności (domyślnie **70%**) dla klas `close` / `skip` / `dismiss` są klikane w środku bounding boxa przez ADB.
+- **Wzorce ręczne „✂️ Zaznacz na ekranie”** – działają **bez modelu AI**, obok niego: gdy na streamie pojawi się reklama, kliknij w oknie konfiguracji **Zaznacz na ekranie** i zaznacz myszką prostokąt wokół krzyżyka/przycisku pominięcia. Wycinek zapisuje się jako `template_N.png` w `ad_templates/` i od razu jest używany – worker szuka go na klatkach przez **Template Matching** (`cv2.matchTemplate`, skala szarości, kilka skal) i klika środek dopasowania.
+- Model AI i wzorce ręczne działają **równolegle** – Ad Killer klika trafienie z najwyższym wynikiem; wystarczy samo jedno ze źródeł (można używać bez wytrenowanego modelu).
 - **🛡️ Auto-Zamykanie [WŁ/WYŁ]** na pasku głównym startuje/zatrzymuje skanowanie.
-- **🛡️ Ad Killer Config** – okno konfiguracji: wybór pliku modelu `.onnx` (📂 Przeglądaj…), suwak czułości (confidence threshold), interwał skanowania (ms) oraz podgląd załadowanych klas (z opcjonalnego pliku `<model>.names`).
-- Bezpieczne działanie: wątek można zatrzymać w każdej chwili (bez nakładania się instancji), GUI nie jest blokowane, a po kliknięciu reklamy skanowanie robi przerwę (cooldown), żeby nie klikać wielokrotnie.
+- **🛡️ Ad Killer Config** – okno konfiguracji: wybór pliku modelu `.onnx` (📂 Przeglądaj…), suwak czułości (confidence threshold), interwał skanowania (ms), podgląd załadowanych klas (z opcjonalnego pliku `<model>.names`), lista wzorców ręcznych z miniaturkami (➕ zaznaczanie na ekranie / 🗑 usuwanie) oraz suwak czułości wzorców.
+- Bezpieczne działanie: wątek można zatrzymać w każdej chwili (bez nakładania się instancji), GUI nie jest blokowane, a po kliknięciu reklamy skanowanie robi przerwę (cooldown), żeby nie klikać wielokrotnie. Nowe/usunięte wzorce są wykrywane na żywo (bez restartu).
 - Eksport modelu (np. z Ultralytics): `yolo export model=ad_detector.pt format=onnx imgsz=640` – wytrenowany na klasach zamykania reklam (`close`, `skip`, `dismiss`).
 
 ### Zapisywanie i kompatybilność
@@ -149,12 +151,13 @@ W oknie aplikacji:
 
 Kliknij **🌐 Multi-Device Control** w górnym pasku głównego okna. W oknie farmy urządzeń dodawaj telefony z listy ADB lub ręcznie po `IP:port`, a następnie używaj akcji zbiorczych (uruchomienie aplikacji / sync tapu na wszystkich urządzeniach).
 
-### Ad Killer (AI)
+### Ad Killer (AI + wzorce ręczne)
 
-1. Umieść model **YOLOv11/ONNX** w katalogu `models/` (np. `models/ad_detector.onnx`) – wyeksportowany np. komendą `yolo export model=ad_detector.pt format=onnx imgsz=640`.
-2. Otwórz **🛡️ Ad Killer Config** i wskaż plik modelu (📂 Przeglądaj…) – okno pokaże stan modelu i klasy (close/skip/dismiss, ewentualnie z pliku `<model>.names`).
-3. Zaznacz **🛡️ Auto-Zamykanie [WŁ]** – aplikacja sama wykryje przyciski zamykania reklam na streamie i kliknie je w środku.
-4. Czułość detekcji (confidence threshold) i częstotliwość skanowania regulujesz w oknie konfiguracji (próg, interwał w ms).
+1. *(Opcjonalnie)* Umieść model **YOLOv11/ONNX** w katalogu `models/` (np. `models/ad_detector.onnx`) – wyeksportowany np. komendą `yolo export model=ad_detector.pt format=onnx imgsz=640`.
+2. Otwórz **🛡️ Ad Killer Config** – jeśli używasz modelu, wskaż plik (📂 Przeglądaj…); okno pokaże stan modelu i klasy (close/skip/dismiss, ewentualnie z pliku `<model>.names`).
+3. **Bez modelu**: poczekaj aż na telefonie pojawi się reklama, kliknij **✂️ Zaznacz na ekranie** i zaznacz prostokąt wokół przycisku zamknięcia/pominięcia na podglądzie. Wzorzec zapisze się w `ad_templates/` i będzie automatycznie klikany przy kolejnych reklamach (Template Matching).
+4. Zaznacz **🛡️ Auto-Zamykanie [WŁ]** – aplikacja sama zamyka reklamy (model AI i/lub wzorce).
+5. Czułość detekcji (confidence), czułość wzorców i częstotliwość skanowania regulujesz w oknie konfiguracji.
 
 ---
 

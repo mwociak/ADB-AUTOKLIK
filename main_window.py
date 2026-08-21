@@ -70,6 +70,9 @@ class MainWindow(QMainWindow):
         self._multi_device_window = None  # MultiDeviceControlWindow (tworzony leniwie)
         self._ad_killer: AIAdKillerWorker | None = None
         self._ad_killer_dialog = None  # AdKillerConfigDialog (tworzony leniwie)
+        # Oczekiwanie na zaznaczenie wzorca Ad Killera na streamie
+        # (po kliknięciu "Zaznacz na ekranie" w oknie konfiguracji).
+        self._ad_capture_pending = False
         # Tryb Powtarzanie: ostatnia wybrana akcja (tap LUB makro) powtarza
         # się w pętli, aż do wyłączenia przełącznika.
         self._tap_repeater: TapRepeatWorker | None = None
@@ -203,6 +206,7 @@ class MainWindow(QMainWindow):
         st.control_swipe.connect(self._on_control_swipe)
         st.point_moved.connect(self._on_point_moved)
         st.macro_step_moved.connect(self._on_macro_step_moved)
+        st.rect_selected.connect(self._on_stream_rect_selected)
 
         # Przełącznik trybu streamu (Sterowanie / Mapowanie)
         self.control_btn.clicked.connect(lambda: self._set_stream_mode(False))
@@ -259,6 +263,19 @@ class MainWindow(QMainWindow):
             self._ad_killer_dialog.detect_all_changed.connect(
                 self._on_ad_detect_all_changed
             )
+            self._ad_killer_dialog.capture_requested.connect(
+                self._on_ad_capture_requested
+            )
+            self._ad_killer_dialog.templates_changed.connect(
+                self._on_ad_templates_changed
+            )
+            self._ad_killer_dialog.template_settings_changed.connect(
+                self._on_ad_template_threshold
+            )
+            # Zamknięcie okna konfiguracji rozbraja oczekiwanie na zaznaczenie.
+            self._ad_killer_dialog.finished.connect(
+                lambda: self._cancel_ad_capture()
+            )
         self._ad_killer_dialog.show()
         self._ad_killer_dialog.raise_()
         self._ad_killer_dialog.activateWindow()
@@ -283,6 +300,9 @@ class MainWindow(QMainWindow):
             close_classes = None
             if self._ad_killer_dialog is not None:
                 close_classes = self._ad_killer_dialog.close_classes
+            template_threshold = 0.8
+            if self._ad_killer_dialog is not None:
+                template_threshold = self._ad_killer_dialog.template_threshold
             worker = AIAdKillerWorker(
                 self.adb,
                 self.stream,
@@ -290,6 +310,7 @@ class MainWindow(QMainWindow):
                 threshold=threshold,
                 interval_ms=interval_ms,
                 close_classes=close_classes,
+                template_threshold=template_threshold,
             )
             worker.detected.connect(self._on_ad_detected)
             worker.status_message.connect(self._status)
@@ -343,6 +364,56 @@ class MainWindow(QMainWindow):
         if self._ad_killer is not None:
             self._ad_killer.set_model_path(model_path)
             self._status(f"🛡️ Nowy model Ad Killer: {model_path}")
+
+    # ------------------------------------------------------------------
+    # Ad Killer - wzorce ręczne ("zaznacz na ekranie")
+    # ------------------------------------------------------------------
+
+    def _on_ad_capture_requested(self) -> None:
+        """Uzbrój zaznaczanie prostokąta na streamie (nowy wzorzec reklamy)."""
+        self._ad_capture_pending = True
+        self.stream.set_rect_capture(True)
+        self._status(
+            "🛡️ Zaznacz myszką prostokąt wokół przycisku zamknięcia/pominięcia "
+            "reklamy na podglądzie telefonu..."
+        )
+
+    def _cancel_ad_capture(self) -> None:
+        """Rozbraja oczekiwanie na zaznaczenie (zamknięto okno konfiguracji)."""
+        if self._ad_capture_pending:
+            self._ad_capture_pending = False
+            self.stream.set_rect_capture(False)
+
+    def _on_ad_templates_changed(self) -> None:
+        """Lista wzorców się zmieniła - przeładuj w działającym workerce."""
+        if self._ad_killer is not None:
+            self._ad_killer.reload_templates()
+            self._status("🛡️ Wzorce Ad Killera odświeżone.")
+
+    def _on_ad_template_threshold(self, threshold: float) -> None:
+        """Zmiana progu dopasowania wzorców w oknie konfiguracji."""
+        if self._ad_killer is not None:
+            self._ad_killer.set_template_threshold(threshold)
+
+    def _on_stream_rect_selected(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        """Zaznaczono prostokąt na streamie - zapisz wzorzec (jeśli uzbrojone)."""
+        if not self._ad_capture_pending:
+            return  # zaznaczenie nie pochodzi z okna Ad Killera
+        self._ad_capture_pending = False
+        self.stream.set_rect_capture(False)
+        frame = self.stream.get_latest_frame()
+        if frame is None or self._ad_killer_dialog is None:
+            self._status("🛡️ Brak klatki streamu - nie można zapisać wzorca.")
+            return
+        h, w = frame.shape[:2]
+        x1, x2 = sorted((max(0, min(int(x1), w - 1)), max(0, min(int(x2), w - 1))))
+        y1, y2 = sorted((max(0, min(int(y1), h - 1)), max(0, min(int(y2), h - 1))))
+        crop = frame[y1 : y2 + 1, x1 : x2 + 1]  # wycinek w natywnej rozdzielczości
+        saved = self._ad_killer_dialog.add_template_from_crop(crop)
+        if saved:
+            self._status(
+                f"🛡️ Zapisano wzorzec: {saved} - Ad Killer klika go automatycznie."
+            )
 
     def _on_ad_detected(self, x: int, y: int) -> None:
         """Wykryto i zamknięto reklamę - LED ADB + komunikat."""
