@@ -155,17 +155,23 @@ def decode_detections(
 ) -> tuple[float, int, int, str, float] | None:
     """Dekoduje tensor wyjściowy YOLO (ONNX, bez NMS).
 
-    Obsługuje **dwa popularne formaty** eksportu YOLO:
+    Obsługuje **trzy popularne formaty** eksportu YOLO:
 
-    1. **YOLO raw** ``(1, 4+nc, N)`` lub ``(4+nc, N)``
-       - 4 pierwsze wiersze: ``x_center, y_center, width, height``
-       - kolejne ``nc`` wierszy: pewności per-klasowe (po sigmoidzie).
+    1. **YOLO raw** ``(4+nc, N)`` — klasyczny format Ultralytics:
+       wiersze 0-3 to ``x_center, y_center, width, height``,
+       kolejne ``nc`` wierszy to pewności per-klasowe (po sigmoidzie).
+       N = liczba kotwic (np. 8400 dla 640x640).
 
-    2. **YOLO transponowany** ``(1, N, 4+nc)`` lub ``(N, 4+nc)``
-       - każdy wiersz to jeden kotwica: ``x1, y1, x2, y2, conf, class_id``
-       - ``(lub) x1, y1, x2, y2, cls1_conf, cls2_conf, ...``
+    2. **YOLO transponowany** ``(N, 4+nc)`` — każdy wiersz to jeden
+       kotwica: ``x1, y1, x2, y2``, potem pewności per-klasowe.
 
-    Automatycznie wykrywa format po kształcie tensora.
+    3. **NMS** ``(N, 6)`` — ``x1, y1, x2, y2, confidence, class_id``
+       (ostatnia kolumna to liczba całkowita).
+
+    Automatycznie wykrywa format. Kluczowa heurystyka: ``nc`` (liczba
+    klas) powinna być **mała** (1-100), ``N`` (liczba kotwic) **duża**
+    (np. 8400). Porównujemy obie interpretacje i wybieramy tę, która
+    daje rozsądne ``nc``.
 
     ``close_classes`` - zbiór nazw klas do wykrycia. Pusty zbiór
     (``DETECT_ALL_CLASSES``) = wykrywaj WSZYSTKIE klasy powyżej progu.
@@ -183,89 +189,83 @@ def decode_detections(
     )
 
     # ---------------------------------------------------------------
-    # Format 1: (4+nc, N) — klasyczny YOLO raw
-    # rows = 4 + num_classes, cols = num_anchors
-    # ---------------------------------------------------------------
-    if rows > cols and rows >= 5:
-        nc = rows - 4
-        _log(f"Format: raw ({rows},{cols}) nc={nc}")
-        boxes_xywh = output[:4]   # (4, N) — xywh
-        scores = output[4:]       # (nc, N) — per-klasowe pewności
-        if scores.max() <= 1.0 and scores.min() >= 0.0:
-            # Prawdopodobnie logity po sigmoidzie — zostawiamy as-is
-            pass
-        class_ids = np.argmax(scores, axis=0)
-        max_scores = scores[class_ids, np.arange(cols)]
-        best = _pick_best(
-            max_scores, class_ids, boxes_xywh[:2], boxes_xywh[2],
-            threshold, class_names, close_classes, fmt="xywh",
-        )
-        if best is not None:
-            return best
-        # Może to jednak format transponowany z małą liczbą klas?
-        # Kontynuuj do Formatu 2 poniżej.
-
-    # ---------------------------------------------------------------
-    # Format 2: (N, 6) — z NMS: x1 y1 x2 y2 confidence class_id
-    # Sprawdzamy PIERWSZY (przed Format 3), bo (N, 4+nc) z nc=2
-    # ma identyczne wymiary. Rozróżniamy po tym, że ostatnia kolumna
-    # to liczby całkowite (class_id), a nie wartości 0-1.
+    # Krok 0: Format NMS — (N, 6) z integer class_id
+    # Sprawdzamy najpierw, gdy cols == 6.
     # ---------------------------------------------------------------
     if rows >= 2 and cols == 6:
         last_col = output[:, 5]
         is_integer_col = np.all(last_col == last_col.astype(int))
         if is_integer_col:
-            xyxy = output[:, :4]           # (N, 4)
-            obj_scores = output[:, 4]      # (N,)
+            xyxy = output[:, :4]
+            obj_scores = output[:, 4]
             class_ids = output[:, 5].astype(int)
-            max_scores = obj_scores
             cx = (xyxy[:, 0] + xyxy[:, 2]) / 2.0
             cy = (xyxy[:, 1] + xyxy[:, 3]) / 2.0
             bw = xyxy[:, 2] - xyxy[:, 0]
             _log("Format: NMS (N,6) xyxy+conf+class_id")
             return _pick_best(
-                max_scores, class_ids,
+                obj_scores, class_ids,
                 np.stack([cx, cy]), bw,
                 threshold, class_names, close_classes, fmt="xywh_center",
             )
 
     # ---------------------------------------------------------------
-    # Format 3: (N, 4+nc) — transponowany YOLO raw (bez NMS)
+    # Krok 1: Porównaj obie interpretacje i wybierz tę z rozsądnym nc.
+    # Interpretacja A: (4+nc, N) → nc_a = rows - 4
+    # Interpretacja B: (N, 4+nc) → nc_b = cols - 4
     # ---------------------------------------------------------------
-    if cols > rows and cols > 5:
-        nc = cols - 4
-        boxes_xyxy = output[:, :4]   # (N, 4) — x1,y1,x2,y2
-        scores = output[:, 4:]       # (N, nc) — per-klasowe
+    nc_a = rows - 4 if rows >= 5 else -1
+    nc_b = cols - 4 if cols >= 5 else -1
+    MAX_CLASSES = 200  # rozsądny maksimum klas
+
+    _log(
+        f"Interpretacje: A=({nc_a}+4, ?) nc_a={nc_a}, "
+        f"B=(?, {nc_b}+4) nc_b={nc_b}"
+    )
+
+    # Wybierz interpretację z mniejszym nc (klasy powinny być małe).
+    use_a = False
+    use_b = False
+    if 0 < nc_a <= MAX_CLASSES and (nc_b <= 0 or nc_b > MAX_CLASSES or nc_a <= nc_b):
+        use_a = True
+    elif 0 < nc_b <= MAX_CLASSES and (nc_a <= 0 or nc_a > MAX_CLASSES or nc_b < nc_a):
+        use_b = True
+    elif 0 < nc_a <= MAX_CLASSES and 0 < nc_b <= MAX_CLASSES:
+        # Oba rozsądne — wybierz z mniejszym nc (bardziej prawdopodobne)
+        use_a = nc_a <= nc_b
+        use_b = not use_a
+
+    if use_a:
+        # Interpretacja A: (4+nc, N) — klasyczny YOLO raw
+        _log(f"Wybrano format A: ({rows},{cols}) = ({nc_a}+4, {cols}), nc={nc_a}")
+        boxes_xywh = output[:4]   # (4, N) — xywh
+        scores = output[4:]       # (nc, N) — per-klasowe pewności
+        class_ids = np.argmax(scores, axis=0)
+        max_scores = scores[class_ids, np.arange(cols)]
+        return _pick_best(
+            max_scores, class_ids, boxes_xywh[:2], boxes_xywh[2],
+            threshold, class_names, close_classes, fmt="xywh",
+        )
+
+    if use_b:
+        # Interpretacja B: (N, 4+nc) — transponowany YOLO
+        _log(f"Wybrano format B: ({rows},{cols}) = ({rows}, {nc_b}+4), nc={nc_b}")
+        boxes_xyxy = output[:, :4]
+        scores = output[:, 4:]
         class_ids = np.argmax(scores, axis=1)
         max_scores = scores[np.arange(rows), class_ids]
         cx = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2.0
         cy = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2.0
         bw = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
-        _log(f"Format: transposed ({rows},{cols}) nc={nc}")
         return _pick_best(
             max_scores, class_ids,
             np.stack([cx, cy]), bw,
             threshold, class_names, close_classes, fmt="xywh_center",
         )
 
-    # ---------------------------------------------------------------
-    # Format 3: (4+nc, N) — spróbuj ponownie jako Format 1
-    # (gdy rows > cols nie zadziałało, bo np. rows == cols)
-    # ---------------------------------------------------------------
-    if rows >= 5:
-        nc = rows - 4
-        boxes_xywh = output[:4]
-        scores = output[4:]
-        class_ids = np.argmax(scores, axis=0)
-        max_scores = scores[class_ids, np.arange(cols)]
-        return _pick_best(
-            max_scores, class_ids, boxes_xywh[:2], boxes_xywh[2],
-            threshold, class_names, close_classes, fmt="xywh",
-        )
-
     _log(
         f"Nie rozpoznano formatu output: shape=({rows},{cols}) — "
-        f"spodziewano (4+nc, N) lub (N, 4+nc)"
+        f"nc_a={nc_a}, nc_b={nc_b} (oba > {MAX_CLASSES} lub <=0)"
     )
     return None
 
