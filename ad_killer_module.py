@@ -54,6 +54,11 @@ DEFAULT_MODEL_PATH = os.path.join("models", "ad_detector.onnx")
 # z niego, a filtr klas pozostaje ten zbiór).
 DEFAULT_CLOSE_CLASSES = frozenset({"close", "skip", "dismiss"})
 
+# Pusty zbiór oznacza "wykrywaj WSZYSTKIE klasy" - każde trafienie
+# powyżej progu pewności generuje tap (przydatne gdy model ma niestandardowe
+# nazwy klas lub jedną klasę "ad").
+DETECT_ALL_CLASSES: frozenset[str] = frozenset()
+
 # Rozmiar wejściowy modelu (imgsz użyty przy eksporcie).
 DEFAULT_INPUT_SIZE = 640
 
@@ -147,39 +152,157 @@ def decode_detections(
     threshold: float,
     class_names: list[str] | None,
     close_classes: frozenset[str],
-) -> tuple[float, int, int, str, float]:
-    """Dekoduje tensor wyjściowy YOLOv11 (ONNX, bez NMS).
+) -> tuple[float, int, int, str, float] | None:
+    """Dekoduje tensor wyjściowy YOLO (ONNX, bez NMS).
 
-    ``output`` ma kształt ``(1, 4 + nc, N)``: 4 pierwsze wiersze to bboxy
-    (``x_center, y_center, width, height`` w pikselach przestrzeni
-    wejściowej, np. 640x640), dalej per-klasowe pewności (już po
-    sigmoidzie - eksport Ultralytics zawiera go w modelu). Dla każdego
-    kotwicy bierzemy klasę o najwyższym score i zostawiamy tylko te, które
-    przekraczają ``threshold`` i należą do ``close_classes``.
+    Obsługuje **dwa popularne formaty** eksportu YOLO:
+
+    1. **YOLO raw** ``(1, 4+nc, N)`` lub ``(4+nc, N)``
+       - 4 pierwsze wiersze: ``x_center, y_center, width, height``
+       - kolejne ``nc`` wierszy: pewności per-klasowe (po sigmoidzie).
+
+    2. **YOLO transponowany** ``(1, N, 4+nc)`` lub ``(N, 4+nc)``
+       - każdy wiersz to jeden kotwica: ``x1, y1, x2, y2, conf, class_id``
+       - ``(lub) x1, y1, x2, y2, cls1_conf, cls2_conf, ...``
+
+    Automatycznie wykrywa format po kształcie tensora.
+
+    ``close_classes`` - zbiór nazw klas do wykrycia. Pusty zbiór
+    (``DETECT_ALL_CLASSES``) = wykrywaj WSZYSTKIE klasy powyżej progu.
 
     Zwraca ``(score, cx, cy, class_name, box_w)`` dla najlepszego trafienia
-    (najwyższy score) albo ``None``, gdy brak detekcji powyżej progu.
+    albo ``None``.
     """
     if output.ndim == 3:
-        output = output[0]  # -> (4 + nc, N)
-    rows, anchors = output.shape
-    if rows < 5 or anchors == 0:
-        return None
-    nc = rows - 4
-    boxes = output[:4]  # (4, N) - xywh w przestrzeni modelu
-    scores = output[4:]  # (nc, N)
-    class_ids = np.argmax(scores, axis=0)
-    max_scores = scores[class_ids, np.arange(anchors)]
+        output = output[0]  # usuń batch dimension
 
+    rows, cols = output.shape
+    _log(
+        f"decode: output shape=({rows}, {cols}), dtype={output.dtype}, "
+        f"close_classes={close_classes or 'ALL'}"
+    )
+
+    # ---------------------------------------------------------------
+    # Format 1: (4+nc, N) — klasyczny YOLO raw
+    # rows = 4 + num_classes, cols = num_anchors
+    # ---------------------------------------------------------------
+    if rows > cols and rows >= 5:
+        nc = rows - 4
+        _log(f"Format: raw ({rows},{cols}) nc={nc}")
+        boxes_xywh = output[:4]   # (4, N) — xywh
+        scores = output[4:]       # (nc, N) — per-klasowe pewności
+        if scores.max() <= 1.0 and scores.min() >= 0.0:
+            # Prawdopodobnie logity po sigmoidzie — zostawiamy as-is
+            pass
+        class_ids = np.argmax(scores, axis=0)
+        max_scores = scores[class_ids, np.arange(cols)]
+        best = _pick_best(
+            max_scores, class_ids, boxes_xywh[:2], boxes_xywh[2],
+            threshold, class_names, close_classes, fmt="xywh",
+        )
+        if best is not None:
+            return best
+        # Może to jednak format transponowany z małą liczbą klas?
+        # Kontynuuj do Formatu 2 poniżej.
+
+    # ---------------------------------------------------------------
+    # Format 2: (N, 6) — z NMS: x1 y1 x2 y2 confidence class_id
+    # Sprawdzamy PIERWSZY (przed Format 3), bo (N, 4+nc) z nc=2
+    # ma identyczne wymiary. Rozróżniamy po tym, że ostatnia kolumna
+    # to liczby całkowite (class_id), a nie wartości 0-1.
+    # ---------------------------------------------------------------
+    if rows >= 2 and cols == 6:
+        last_col = output[:, 5]
+        is_integer_col = np.all(last_col == last_col.astype(int))
+        if is_integer_col:
+            xyxy = output[:, :4]           # (N, 4)
+            obj_scores = output[:, 4]      # (N,)
+            class_ids = output[:, 5].astype(int)
+            max_scores = obj_scores
+            cx = (xyxy[:, 0] + xyxy[:, 2]) / 2.0
+            cy = (xyxy[:, 1] + xyxy[:, 3]) / 2.0
+            bw = xyxy[:, 2] - xyxy[:, 0]
+            _log("Format: NMS (N,6) xyxy+conf+class_id")
+            return _pick_best(
+                max_scores, class_ids,
+                np.stack([cx, cy]), bw,
+                threshold, class_names, close_classes, fmt="xywh_center",
+            )
+
+    # ---------------------------------------------------------------
+    # Format 3: (N, 4+nc) — transponowany YOLO raw (bez NMS)
+    # ---------------------------------------------------------------
+    if cols > rows and cols > 5:
+        nc = cols - 4
+        boxes_xyxy = output[:, :4]   # (N, 4) — x1,y1,x2,y2
+        scores = output[:, 4:]       # (N, nc) — per-klasowe
+        class_ids = np.argmax(scores, axis=1)
+        max_scores = scores[np.arange(rows), class_ids]
+        cx = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2.0
+        cy = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2.0
+        bw = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
+        _log(f"Format: transposed ({rows},{cols}) nc={nc}")
+        return _pick_best(
+            max_scores, class_ids,
+            np.stack([cx, cy]), bw,
+            threshold, class_names, close_classes, fmt="xywh_center",
+        )
+
+    # ---------------------------------------------------------------
+    # Format 3: (4+nc, N) — spróbuj ponownie jako Format 1
+    # (gdy rows > cols nie zadziałało, bo np. rows == cols)
+    # ---------------------------------------------------------------
+    if rows >= 5:
+        nc = rows - 4
+        boxes_xywh = output[:4]
+        scores = output[4:]
+        class_ids = np.argmax(scores, axis=0)
+        max_scores = scores[class_ids, np.arange(cols)]
+        return _pick_best(
+            max_scores, class_ids, boxes_xywh[:2], boxes_xywh[2],
+            threshold, class_names, close_classes, fmt="xywh",
+        )
+
+    _log(
+        f"Nie rozpoznano formatu output: shape=({rows},{cols}) — "
+        f"spodziewano (4+nc, N) lub (N, 4+nc)"
+    )
+    return None
+
+
+def _pick_best(
+    max_scores: np.ndarray,
+    class_ids: np.ndarray,
+    centers: np.ndarray,
+    widths: np.ndarray,
+    threshold: float,
+    class_names: list[str] | None,
+    close_classes: frozenset[str],
+    fmt: str = "xywh",
+) -> tuple[float, int, int, str, float] | None:
+    """Wybiera najlepsze trafienie spośród detekcji powyżej progu."""
+    above = np.where(max_scores >= threshold)[0]
+    _log(
+        f"detekcje powyżej progu {threshold:.2f}: {len(above)} "
+        f"(z {len(max_scores)} łącznie)"
+    )
     best: tuple[float, int, int, str, float] | None = None
-    for idx in np.where(max_scores >= threshold)[0]:
+    for idx in above:
         cls_id = int(class_ids[idx])
-        name = _class_name(cls_id, class_names, close_classes)
-        # Filtrujemy klasy odpowiedzialne za zamykanie reklam.
-        if name not in close_classes:
+        name = _class_name(cls_id, class_names)
+        _log(
+            f"  kandydat: klasa={cls_id}('{name}') conf={max_scores[idx]:.3f}"
+        )
+        # Filtr: pusty close_classes = wykrywaj WSZYSTKIE klasy.
+        if close_classes and name not in close_classes:
+            _log(f"    -> odrzucono (klasa '{name}' nie w close_classes)")
             continue
-        cx, cy = float(boxes[0, idx]), float(boxes[1, idx])
-        bw = float(boxes[2, idx])
+        if fmt == "xywh":
+            cx, cy = float(centers[0, idx]), float(centers[1, idx])
+            bw = float(widths[idx])
+        else:  # xywh_center
+            cx, cy = float(centers[0, idx]), float(centers[1, idx])
+            bw = float(widths[idx])
         score = float(max_scores[idx])
         if best is None or score > best[0]:
             best = (score, cx, cy, name, bw)
@@ -187,15 +310,14 @@ def decode_detections(
 
 
 def _class_name(
-    cls_id: int, class_names: list[str] | None, close_classes: frozenset[str]
+    cls_id: int, class_names: list[str] | None,
 ) -> str:
     """Nazwa klasy dla ``cls_id`` (z pliku .names albo domyślna)."""
     if class_names is not None and cls_id < len(class_names):
         return class_names[cls_id]
-    if class_names is None and cls_id < len(DEFAULT_CLOSE_CLASSES):
-        # Bez pliku .names zakładamy, że model ma klasy close/skip/dismiss.
-        return ("close", "skip", "dismiss")[cls_id]
-    return f"class_{cls_id}"
+    # Domyślne nazwy dla klas 0-2 (popularne w modelach ad-killera).
+    defaults = {0: "close", 1: "skip", 2: "dismiss"}
+    return defaults.get(cls_id, f"class_{cls_id}")
 
 
 class AIAdKillerWorker(QThread):
@@ -244,6 +366,12 @@ class AIAdKillerWorker(QThread):
         """Ustawia interwał skanowania w milisekundach (min. 100 ms)."""
         with self._lock:
             self._interval_ms = max(100, int(interval_ms))
+
+    def set_close_classes(self, close_classes: frozenset[str]) -> None:
+        """Ustawia zbiór klas do wykrywania (pusty = wykrywaj WSZYSTKIE)."""
+        with self._lock:
+            self._close_classes = close_classes
+        _log(f"Ustawiono close_classes: {close_classes or 'ALL (detect all)'}")
 
     def set_model_path(self, model_path: str) -> None:
         """Podmienia model ONNX w locie (przeładowanie przy następnym cyklu).
@@ -315,13 +443,18 @@ class AIAdKillerWorker(QThread):
                     if self._class_names
                     else "close, skip, dismiss (domyślne)"
                 )
+                # Zaloguj kształt wyjścia modelu - kluczowe dla diagnostyki.
+                out_meta = session.get_outputs()[0] if session.get_outputs() else None
+                out_shape = out_meta.shape if out_meta else "unknown"
                 _log(
-                    f"Wczytano model ONNX: {model_path} "
-                    f"(wejście {self._input_size}x{self._input_size}, "
-                    f"klasy: {names}, provider: {session.get_providers()})"
+                    f"Wczytano model ONNX: {model_path}\n"
+                    f"  wejście: {input_meta.name} {shape}\n"
+                    f"  wyjście: {out_meta.name if out_meta else '?'} {out_shape}\n"
+                    f"  klasy: {names}, provider: {session.get_providers()}"
                 )
                 self.status_message.emit(
-                    f"🛡️ Model AI załadowany: {os.path.basename(model_path)}"
+                    f"🛡️ Model AI: {os.path.basename(model_path)} "
+                    f"(wyjście {out_shape})"
                 )
                 return True
             except Exception as exc:  # noqa: BLE001 - worker nie może umrzeć
@@ -341,6 +474,7 @@ class AIAdKillerWorker(QThread):
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        _log("Worker uruchomiony - rozpoczynam skanowanie")
         while not self._stop_event.is_set():
             if not self._ensure_session():
                 # Model niedostępny - nie mielimy CPU, spróbuj za chwilę.
@@ -348,7 +482,7 @@ class AIAdKillerWorker(QThread):
                 continue
             frame = self._stream.get_latest_frame()
             if frame is None:
-                # Brak streamu/klatki - poczekaj i spróbuj ponownie.
+                _log("Brak klatki ze streamu - czekam...")
                 self._stop_event.wait(self._interval_ms / 1000.0)
                 continue
             with self._lock:
@@ -385,18 +519,18 @@ class AIAdKillerWorker(QThread):
         """
         h, w = frame.shape[:2]
         blob, scale, pad_x, pad_y = preprocess(frame, self._input_size)
+        _log(f"Skanowanie klatki {w}x{h} -> blob {blob.shape}, scale={scale:.3f}")
         try:
             outputs = self._session.run(None, {self._session.get_inputs()[0].name: blob})
+            _log(f"Inferencja OK: {len(outputs)} output(s), shape={[o.shape for o in outputs]}")
         except Exception as exc:  # noqa: BLE001 - worker nie może umrzeć
-            print(
-                f"[AIAdKillerWorker] Błąd inferencji: {exc}",
-                file=sys.stderr,
-            )
+            _log(f"Błąd inferencji: {exc}")
             return None
         detection = decode_detections(
             outputs[0], threshold, self._class_names, close_classes
         )
         if detection is None:
+            _log("Brak detekcji powyżej progu")
             return None
         score, cx, cy, name, _bw = detection
         # Przeliczenie ze współrzędnych modelu (letterbox 640x640)

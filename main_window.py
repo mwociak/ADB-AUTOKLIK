@@ -256,6 +256,9 @@ class MainWindow(QMainWindow):
             self._ad_killer_dialog.model_changed.connect(
                 self._on_ad_model_changed
             )
+            self._ad_killer_dialog.detect_all_changed.connect(
+                self._on_ad_detect_all_changed
+            )
         self._ad_killer_dialog.show()
         self._ad_killer_dialog.raise_()
         self._ad_killer_dialog.activateWindow()
@@ -277,12 +280,16 @@ class MainWindow(QMainWindow):
                 threshold = self._ad_killer_dialog.threshold
                 interval_ms = self._ad_killer_dialog.interval_ms
                 model_path = self._ad_killer_dialog.model_path
+            close_classes = None
+            if self._ad_killer_dialog is not None:
+                close_classes = self._ad_killer_dialog.close_classes
             worker = AIAdKillerWorker(
                 self.adb,
                 self.stream,
                 model_path=model_path,
                 threshold=threshold,
                 interval_ms=interval_ms,
+                close_classes=close_classes,
             )
             worker.detected.connect(self._on_ad_detected)
             worker.status_message.connect(self._status)
@@ -319,6 +326,17 @@ class MainWindow(QMainWindow):
         if self._ad_killer is not None:
             self._ad_killer.set_threshold(threshold)
             self._ad_killer.set_interval_ms(interval_ms)
+
+    def _on_ad_detect_all_changed(self, detect_all: bool) -> None:
+        """Zmiana trybu wykrywania: wszystkie klasy vs tylko close/skip/dismiss."""
+        if self._ad_killer is not None:
+            from ad_killer_module import DETECT_ALL_CLASSES
+
+            classes = DETECT_ALL_CLASSES if detect_all else frozenset({"close", "skip", "dismiss"})
+            self._ad_killer.set_close_classes(classes)
+            self._status(
+                f"🛡️ {'Wykrywanie WSZYSTKICH klas' if detect_all else 'Filtr klas: close/skip/dismiss'}"
+            )
 
     def _on_ad_model_changed(self, model_path: str) -> None:
         """Wybrano nowy model ONNX - podmień w działającym workerce."""

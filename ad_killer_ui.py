@@ -17,6 +17,7 @@ import os
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -29,7 +30,11 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ad_killer_module import default_model_path, load_class_names
+from ad_killer_module import (
+    DETECT_ALL_CLASSES,
+    default_model_path,
+    load_class_names,
+)
 
 
 class AdKillerConfigDialog(QDialog):
@@ -37,6 +42,7 @@ class AdKillerConfigDialog(QDialog):
 
     settings_changed = pyqtSignal(float, int)  # (threshold, interval_ms)
     model_changed = pyqtSignal(str)  # wybrano nowy plik modelu ONNX
+    detect_all_changed = pyqtSignal(bool)  # zmiana trybu "wykrywaj WSZYSTKIE klasy"
 
     def __init__(self, model_path: str | None = None, parent=None) -> None:
         super().__init__(parent)
@@ -63,6 +69,16 @@ class AdKillerConfigDialog(QDialog):
         model_row.addWidget(self.model_edit, 1)
         model_row.addWidget(self.browse_button)
         layout.addLayout(model_row)
+
+        self.detect_all_check = QCheckBox(
+            "🎯 Wykrywaj WSZYSTKIE klasy (ignoruj nazwy klas)"
+        )
+        self.detect_all_check.setToolTip(
+            "Gdy włączone - każde wykrycie powyżej progu generuje tap, "
+            "niezależnie od nazwy klasy. Przydatne gdy model ma niestandardowe "
+            "nazwy klas lub jedną klasę."
+        )
+        layout.addWidget(self.detect_all_check)
 
         self.model_status = QLabel("")
         self.model_status.setWordWrap(True)
@@ -100,6 +116,7 @@ class AdKillerConfigDialog(QDialog):
         self.browse_button.clicked.connect(self._on_browse)
         self.threshold_slider.valueChanged.connect(self._on_settings_changed)
         self.interval_spin.valueChanged.connect(self._on_settings_changed)
+        self.detect_all_check.toggled.connect(self._on_detect_all_toggled)
 
     # ------------------------------------------------------------------
     # Ustawienia
@@ -109,6 +126,18 @@ class AdKillerConfigDialog(QDialog):
     def threshold(self) -> float:
         """Próg pewności detekcji (0.0-1.0) z suwaka."""
         return self.threshold_slider.value() / 100.0
+
+    @property
+    def detect_all(self) -> bool:
+        """Czy wykrywać WSZYSTKIE klasy (ignoruj nazwy klas)."""
+        return self.detect_all_check.isChecked()
+
+    @property
+    def close_classes(self) -> frozenset[str]:
+        """Zwraca zbiór klas do wykrywania lub pusty (detect_all)."""
+        if self.detect_all:
+            return DETECT_ALL_CLASSES
+        return frozenset({"close", "skip", "dismiss"})
 
     @property
     def interval_ms(self) -> int:
@@ -123,6 +152,9 @@ class AdKillerConfigDialog(QDialog):
     def _on_settings_changed(self) -> None:
         self.threshold_label.setText(f"{self.threshold_slider.value()}%")
         self.settings_changed.emit(self.threshold, self.interval_ms)
+
+    def _on_detect_all_toggled(self, checked: bool) -> None:
+        self.detect_all_changed.emit(checked)
 
     # ------------------------------------------------------------------
     # Wybór modelu
